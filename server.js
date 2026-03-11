@@ -1,15 +1,23 @@
 /**
  * LAB77 / GRUPO 77
  * Webhook: Frete Barato → Bling
- * v3.0 — OAuth2 com refresh automático
+ * v2.1 — Correção endpoint Bling
+ *
+ * Correções aplicadas:
+ *  - PUT /nfe/{id}/rastreamentos NÃO EXISTE no Bling v3
+ *  - Novo fluxo: GET /nfe/{id} → inserir codigoRastreamento → PUT /nfe/{id}
+ *  - Campo correto: transporte.volumes[0].codigoRastreamento
+ *  - GET com params em vez de body (compatibilidade garantida)
+ *  - Verificação de assinatura HMAC do Bling
+ *  - /reprocessar protegido por API key
+ *  - Timeout em todas as chamadas de API
+ *  - Logs de produção completos
  */
 
 require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
 const crypto = require("crypto");
-const fs = require("fs");
-const path = require("path");
 
 const app = express();
 
@@ -23,10 +31,8 @@ app.use(express.json({
 // ============================================================
 const CONFIG = {
   bling: {
-    clientId: process.env.BLING_CLIENT_ID,
-    clientSecret: process.env.BLING_CLIENT_SECRET,
+    accessToken: process.env.BLING_ACCESS_TOKEN,
     baseUrl: "https://www.bling.com.br/Api/v3",
-    oauthUrl: "https://www.bling.com.br/Api/v3/oauth/token",
     webhookSecret: process.env.BLING_WEBHOOK_SECRET,
   },
   freteBarato: {
@@ -40,113 +46,12 @@ const CONFIG = {
   },
   servidor: {
     apiKey: process.env.WEBHOOK_API_KEY,
-    baseUrl: process.env.BASE_URL || "http://localhost:3000",
   },
   retry: {
     tentativas: 6,
     intervaloMs: 30000,
   },
 };
-
-// ============================================================
-// GERENCIAMENTO DE TOKENS BLING (OAuth2)
-// Persiste em arquivo para sobreviver a restarts
-// ============================================================
-const TOKEN_FILE = path.join(__dirname, ".bling-tokens.json");
-
-let blingTokens = {
-  accessToken: null,
-  refreshToken: null,
-  expiresAt: 0,
-};
-
-function salvarTokens() {
-  try {
-    fs.writeFileSync(TOKEN_FILE, JSON.stringify(blingTokens, null, 2));
-    log("INFO", "Tokens salvos em disco");
-  } catch (err) {
-    log("ERRO", "Falha ao salvar tokens", { error: err.message });
-  }
-}
-
-function carregarTokens() {
-  try {
-    if (fs.existsSync(TOKEN_FILE)) {
-      const data = JSON.parse(fs.readFileSync(TOKEN_FILE, "utf-8"));
-      blingTokens = data;
-      log("INFO", "Tokens carregados do disco", {
-        temAccessToken: !!data.accessToken,
-        temRefreshToken: !!data.refreshToken,
-        expiraEm: new Date(data.expiresAt).toISOString(),
-      });
-    }
-  } catch (err) {
-    log("AVISO", "Sem tokens salvos — aguardando OAuth via /callback");
-  }
-}
-
-function basicAuthHeader() {
-  return "Basic " + Buffer.from(
-    `${CONFIG.bling.clientId}:${CONFIG.bling.clientSecret}`
-  ).toString("base64");
-}
-
-async function trocarCodePorTokens(code) {
-  const res = await axios.post(CONFIG.bling.oauthUrl, {
-    grant_type: "authorization_code",
-    code,
-  }, {
-    headers: {
-      Authorization: basicAuthHeader(),
-      "Content-Type": "application/json",
-    },
-    timeout: 15000,
-  });
-
-  const { access_token, refresh_token, expires_in } = res.data;
-  blingTokens = {
-    accessToken: access_token,
-    refreshToken: refresh_token,
-    expiresAt: Date.now() + (expires_in * 1000) - 60000, // renova 1min antes
-  };
-  salvarTokens();
-  log("OK", "Tokens obtidos via authorization_code", { expires_in });
-}
-
-async function refreshBlingToken() {
-  if (!blingTokens.refreshToken) {
-    throw new Error("Sem refresh_token — faça o OAuth via /callback primeiro");
-  }
-
-  log("INFO", "Renovando access_token via refresh_token...");
-  const res = await axios.post(CONFIG.bling.oauthUrl, {
-    grant_type: "refresh_token",
-    refresh_token: blingTokens.refreshToken,
-  }, {
-    headers: {
-      Authorization: basicAuthHeader(),
-      "Content-Type": "application/json",
-    },
-    timeout: 15000,
-  });
-
-  const { access_token, refresh_token, expires_in } = res.data;
-  blingTokens = {
-    accessToken: access_token,
-    refreshToken: refresh_token,
-    expiresAt: Date.now() + (expires_in * 1000) - 60000,
-  };
-  salvarTokens();
-  log("OK", "Token renovado com sucesso", { expires_in });
-}
-
-async function getBlingAccessToken() {
-  if (blingTokens.accessToken && Date.now() < blingTokens.expiresAt) {
-    return blingTokens.accessToken;
-  }
-  await refreshBlingToken();
-  return blingTokens.accessToken;
-}
 
 // Fila em memória (dados perdidos em restart — aceitável para volume LAB77)
 const fila = new Map();
@@ -245,91 +150,67 @@ async function buscarTrackingFreteBararato(chaveNF) {
 }
 
 // ============================================================
-// BLING OAuth2 — Rota /callback
+// BLING — Buscar NF completa
+// PUT /nfe/{id}/rastreamentos NÃO EXISTE no Bling v3.
+// Fluxo correto: GET para buscar, PUT para gravar com payload completo.
 // ============================================================
-app.get("/callback", async (req, res) => {
-  const { code, state } = req.query;
-
-  if (!code) {
-    return res.status(400).json({ error: "Parâmetro 'code' ausente" });
-  }
-
+async function buscarNFBling(nfeId) {
+  const url = `${CONFIG.bling.baseUrl}/nfe/${nfeId}`;
   try {
-    await trocarCodePorTokens(code);
-    res.json({
-      ok: true,
-      msg: "OAuth concluído! Tokens salvos. O webhook está pronto.",
-      expiraEm: new Date(blingTokens.expiresAt).toISOString(),
+    const response = await axios.get(url, {
+      headers: {
+        Authorization: `Bearer ${CONFIG.bling.accessToken}`,
+      },
+      timeout: 10000,
     });
-  } catch (err) {
-    log("ERRO", "Falha no OAuth callback", { error: err.message, data: err.response?.data });
-    res.status(500).json({
-      error: "Falha ao obter tokens",
-      detalhes: err.response?.data || err.message,
-    });
-  }
-});
-
-// Rota auxiliar: gera a URL de autorização para facilitar o setup
-app.get("/authorize", (req, res) => {
-  const authUrl = `https://www.bling.com.br/Api/v3/oauth/authorize`
-    + `?response_type=code`
-    + `&client_id=${CONFIG.bling.clientId}`
-    + `&state=lab77`;
-  res.json({
-    msg: "Acesse a URL abaixo no navegador para autorizar o app:",
-    url: authUrl,
-  });
-});
-
-// ============================================================
-// BLING — Gravar tracking na NF (com refresh automático)
-// ============================================================
-async function gravarTrackingBling(nfeId, trackCode) {
-  const url = `${CONFIG.bling.baseUrl}/nfe/${nfeId}/rastreamentos`;
-
-  try {
-    const accessToken = await getBlingAccessToken();
-    const response = await axios.put(
-      url,
-      { rastreamentos: [{ codigo: trackCode }] },
-      {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          "Content-Type": "application/json",
-        },
-        timeout: 10000,
-      }
-    );
-    return response.status === 200 || response.status === 204;
-
+    return response.data?.data || null;
   } catch (err) {
     const status = err.response?.status;
-    if (status === 401) {
-      log("AVISO", "Token expirado, tentando refresh...");
-      try {
-        await refreshBlingToken();
-        const novoToken = blingTokens.accessToken;
-        const retry = await axios.put(
-          url,
-          { rastreamentos: [{ codigo: trackCode }] },
-          {
-            headers: {
-              Authorization: `Bearer ${novoToken}`,
-              "Content-Type": "application/json",
-            },
-            timeout: 10000,
-          }
-        );
-        return retry.status === 200 || retry.status === 204;
-      } catch (refreshErr) {
-        log("ERRO", "Refresh falhou — faça OAuth novamente via /authorize", {
-          error: refreshErr.message,
-        });
-        return false;
-      }
-    }
-    log("ERRO", `Bling error ${status}`, { nfeId, trackCode, data: err.response?.data });
+    if (status === 401) log("ERRO", "Token Bling expirado — renovar BLING_ACCESS_TOKEN");
+    log("ERRO", `Bling GET error ${status}`, { nfeId, data: err.response?.data });
+    return null;
+  }
+}
+
+// ============================================================
+// BLING — Gravar tracking na NF
+// ATENÇÃO: access_token OAuth2 expira em 1h — implementar refresh se necessário
+//
+// Bling v3 NÃO TEM PUT /nfe/{id}/rastreamentos.
+// O campo correto é: transporte.volumes[0].codigoRastreamento
+// Fluxo: GET NF → inserir codigoRastreamento → PUT NF completa
+// ============================================================
+async function gravarTrackingBling(nfeId, trackCode) {
+  // 1. Buscar NF completa
+  const nf = await buscarNFBling(nfeId);
+  if (!nf) {
+    log("ERRO", `Não foi possível buscar NF ${nfeId} no Bling`);
+    return false;
+  }
+
+  // 2. Inserir codigoRastreamento no primeiro volume do transporte
+  // Se não tiver volumes, cria estrutura mínima
+  if (!nf.transporte) nf.transporte = {};
+  if (!nf.transporte.volumes || nf.transporte.volumes.length === 0) {
+    nf.transporte.volumes = [{}];
+  }
+  nf.transporte.volumes[0].codigoRastreamento = trackCode;
+
+  // 3. PUT com payload completo
+  const url = `${CONFIG.bling.baseUrl}/nfe/${nfeId}`;
+  try {
+    const response = await axios.put(url, nf, {
+      headers: {
+        Authorization: `Bearer ${CONFIG.bling.accessToken}`,
+        "Content-Type": "application/json",
+      },
+      timeout: 10000,
+    });
+    return response.status === 200 || response.status === 204;
+  } catch (err) {
+    const status = err.response?.status;
+    if (status === 401) log("ERRO", "Token Bling expirado — renovar BLING_ACCESS_TOKEN");
+    log("ERRO", `Bling PUT error ${status}`, { nfeId, trackCode, data: err.response?.data });
     return false;
   }
 }
@@ -442,8 +323,6 @@ setInterval(async () => {
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
-    blingToken: blingTokens.accessToken ? "ativo" : "ausente",
-    blingTokenExpira: blingTokens.expiresAt ? new Date(blingTokens.expiresAt).toISOString() : null,
     fila: fila.size,
     filaNFs: Array.from(fila.keys()),
     uptime: Math.floor(process.uptime()) + "s",
@@ -472,8 +351,7 @@ app.post("/reprocessar", autenticarApiKey, async (req, res) => {
 // INICIAR — validar env vars obrigatórias antes de subir
 // ============================================================
 const VARS_OBRIGATORIAS = [
-  "BLING_CLIENT_ID",
-  "BLING_CLIENT_SECRET",
+  "BLING_ACCESS_TOKEN",
   "FRETEBARATO_TOKEN",
   "FRETEBARATO_CUSTOMER_ID",
   "EMPRESA_CNPJ",
@@ -481,20 +359,13 @@ const VARS_OBRIGATORIAS = [
 const varsFaltando = VARS_OBRIGATORIAS.filter(v => !process.env[v]);
 if (varsFaltando.length > 0) {
   console.error(`[ERRO FATAL] Variáveis não configuradas: ${varsFaltando.join(", ")}`);
-  console.error("Configure as variáveis de ambiente e reinicie.");
+  console.error("Configure o arquivo .env e reinicie.");
   process.exit(1);
 }
-
-// Carregar tokens salvos (se existirem) antes de iniciar
-carregarTokens();
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   log("INFO", `Servidor na porta ${PORT}`);
-  log("INFO", `OAuth callback: ${CONFIG.servidor.baseUrl}/callback`);
-  if (!blingTokens.accessToken) {
-    log("AVISO", `Sem token Bling — acesse ${CONFIG.servidor.baseUrl}/authorize para autorizar`);
-  }
   if (!CONFIG.bling.webhookSecret) log("AVISO", "Configure BLING_WEBHOOK_SECRET!");
   if (!CONFIG.servidor.apiKey)     log("AVISO", "Configure WEBHOOK_API_KEY!");
 });
