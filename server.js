@@ -260,10 +260,22 @@ app.post("/webhook/bling", (req, res) => {
   }
 
   const body = req.body;
-  log("INFO", `Webhook`, { event: body?.event, nfeId: body?.data?.id });
 
-  if (!body || body.event !== "nfe.authorized") {
-    return res.status(200).json({ ok: true, msg: "evento ignorado" });
+  // DEBUG: loga o payload COMPLETO pra descobrir o evento exato que o Bling manda
+  log("DEBUG", `Webhook recebido — evento: "${body?.event}"`, body);
+
+  if (!body) {
+    return res.status(200).json({ ok: true, msg: "body vazio ignorado" });
+  }
+
+  // Aceita nfe.authorized e também qualquer variação de "update" com situação autorizada
+  const situacaoAutorizada = body.data?.situacao?.valor === "A" || body.data?.situacao === "A";
+  const eventoAceito = body.event === "nfe.authorized" || 
+    (["nfe.update", "nfe.atualização"].includes(body.event) && situacaoAutorizada);
+
+  if (!eventoAceito) {
+    log("INFO", `Evento "${body.event}" ignorado`);
+    return res.status(200).json({ ok: true, msg: `evento ignorado: ${body.event}` });
   }
 
   const nfeId = body.data?.id;
