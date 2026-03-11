@@ -365,15 +365,22 @@ async function buscarNFBling(nfeId) {
 }
 
 async function gravarTrackingBling(nfeId, trackCode) {
-  // NFs autorizadas são read-only no Bling — gravar tracking no pedido de venda
-  // 1. Buscar NF para encontrar o pedido de venda vinculado
+  // NFs autorizadas são read-only no Bling
+  // Estratégia: buscar NF → encontrar pedido vinculado → gravar tracking no pedido
   const nf = await buscarNFBling(nfeId);
   if (!nf) { log("ERRO", `Não foi possível buscar NF ${nfeId}`); return false; }
 
-  const pedidoId = nf.pedidoVenda?.id || nf.vendedor?.pedidoVenda?.id;
+  // Log das chaves da NF para debug (ajuda a encontrar a referência ao pedido)
+  log("INFO", `NF ${nfeId} keys: ${Object.keys(nf).join(", ")}`);
+
+  // Tentar encontrar o pedido de venda em vários caminhos possíveis
+  const pedidoId = nf.pedidoVenda?.id
+    || nf.pedido?.id
+    || nf.vendas?.id
+    || nf.pedidosVenda?.[0]?.id
+    || nf.contato?.pedidoVenda?.id;
 
   if (pedidoId) {
-    // Gravar tracking no pedido de venda
     try {
       const response = await blingRequest("put", `/pedidos/vendas/${pedidoId}`, {
         transporte: {
@@ -383,28 +390,29 @@ async function gravarTrackingBling(nfeId, trackCode) {
       log("OK", `Tracking gravado no pedido ${pedidoId}`, { nfeId, trackCode });
       return response.status === 200 || response.status === 204;
     } catch (err) {
-      log("ERRO", `Bling PUT /pedidos/vendas/${pedidoId} error ${err.response?.status}`, {
-        data: err.response?.data,
-        nfeId,
-        trackCode,
-      });
+      log("ERRO", `PUT /pedidos/vendas/${pedidoId} error ${err.response?.status}`, { data: err.response?.data });
     }
   } else {
-    log("AVISO", `NF ${nfeId} sem pedido de venda vinculado — tentando PUT direto na NF`);
+    log("AVISO", `NF ${nfeId} sem pedido vinculado — tentando POST /logisticas/objetos`);
   }
 
-  // Fallback: tentar PUT direto na NF (funciona se NF não estiver autorizada)
+  // Fallback: criar objeto logístico (funciona sem pedido de venda)
   try {
-    const response = await blingRequest("put", `/nfe/${nfeId}`, {
-      transporte: {
-        volumes: [{ codigoRastreamento: trackCode }],
+    const response = await blingRequest("post", `/logisticas/objetos`, {
+      notaFiscal: { id: nfeId },
+      rastreamento: {
+        codigo: trackCode,
+        descricao: "Rastreamento automático",
+        situacao: 5, // 5 = Em aberto
       },
     });
-    return response.status === 200 || response.status === 204;
+    log("OK", `Objeto logístico criado para NF ${nfeId}`, { trackCode, objetoId: response.data?.data?.id });
+    return true;
   } catch (err) {
-    log("ERRO", `Bling PUT /nfe/${nfeId} error ${err.response?.status}`, { data: err.response?.data });
-    return false;
+    log("ERRO", `POST /logisticas/objetos error ${err.response?.status}`, { data: err.response?.data });
   }
+
+  return false;
 }
 
 // ============================================================
