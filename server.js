@@ -259,7 +259,9 @@ app.post("/webhook/bling", rateLimit, (req, res) => {
   // Situação 9 = Autorizada (confirmado via log de produção)
   // Aceita também situação "A" por compatibilidade
   const situacao = body.data?.situacao?.valor ?? body.data?.situacao;
-  const situacaoAutorizada = situacao === 9 || situacao === "9" || situacao === "A";
+  // Situação 6 = Autorizada (confirmado em produção LAB77)
+  // Aceita também 9 e "A" por compatibilidade com outras contas Bling
+  const situacaoAutorizada = situacao === 6 || situacao === "6" || situacao === 9 || situacao === "9" || situacao === "A";
   const eventosAceitos = [
     "invoice.created",
     "invoice.updated",
