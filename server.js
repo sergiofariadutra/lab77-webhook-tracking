@@ -18,6 +18,8 @@ require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
 const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
 
 const app = express();
 
@@ -66,7 +68,10 @@ const CONFIG = {
     baseUrl: "https://admin.fretebarato.com",
   },
   empresa: { cnpj: process.env.EMPRESA_CNPJ },
-  servidor: { apiKey: process.env.WEBHOOK_API_KEY },
+  servidor: {
+    apiKey: process.env.WEBHOOK_API_KEY,
+    baseUrl: process.env.BASE_URL || "http://localhost:3000",
+  },
   retry: { tentativas: 6, intervaloMs: 30000 },
 };
 
@@ -80,30 +85,70 @@ function log(nivel, mensagem, dados = null) {
 }
 
 // ============================================================
+// PERSISTÊNCIA DE TOKENS BLING (sobrevive a restarts)
+// ============================================================
+const TOKEN_FILE = path.join(__dirname, ".bling-tokens.json");
+
+function salvarTokens() {
+  try {
+    fs.writeFileSync(TOKEN_FILE, JSON.stringify({
+      accessToken: CONFIG.bling.accessToken,
+      refreshToken: CONFIG.bling.refreshToken,
+      expiresAt: CONFIG.bling.tokenExpiresAt,
+    }, null, 2));
+    log("INFO", "Tokens salvos em disco");
+  } catch (err) {
+    log("AVISO", "Falha ao salvar tokens em disco", { error: err.message });
+  }
+}
+
+function carregarTokens() {
+  try {
+    if (fs.existsSync(TOKEN_FILE)) {
+      const data = JSON.parse(fs.readFileSync(TOKEN_FILE, "utf-8"));
+      if (data.accessToken) CONFIG.bling.accessToken = data.accessToken;
+      if (data.refreshToken) CONFIG.bling.refreshToken = data.refreshToken;
+      if (data.expiresAt) CONFIG.bling.tokenExpiresAt = data.expiresAt;
+      log("INFO", "Tokens carregados do disco", {
+        temAccessToken: !!data.accessToken,
+        temRefreshToken: !!data.refreshToken,
+        expiraEm: new Date(data.expiresAt).toISOString(),
+      });
+    }
+  } catch (err) {
+    log("AVISO", "Sem tokens salvos em disco");
+  }
+}
+
+function basicAuthHeader() {
+  return "Basic " + Buffer.from(`${CONFIG.bling.clientId}:${CONFIG.bling.clientSecret}`).toString("base64");
+}
+
+// ============================================================
 // TOKEN BLING — Refresh automático
 // ============================================================
 async function renovarTokenBling() {
   if (!CONFIG.bling.refreshToken || !CONFIG.bling.clientId || !CONFIG.bling.clientSecret) {
-    log("AVISO", "Refresh token não configurado — token pode expirar em produção");
+    log("AVISO", "Refresh token não configurado — faça OAuth via /oauth/callback");
     return false;
   }
   try {
-    const credentials = Buffer.from(`${CONFIG.bling.clientId}:${CONFIG.bling.clientSecret}`).toString("base64");
     const response = await axios.post(
       "https://www.bling.com.br/Api/v3/oauth/token",
       new URLSearchParams({ grant_type: "refresh_token", refresh_token: CONFIG.bling.refreshToken }),
       {
-        headers: { Authorization: `Basic ${credentials}`, "Content-Type": "application/x-www-form-urlencoded" },
+        headers: { Authorization: basicAuthHeader(), "Content-Type": "application/x-www-form-urlencoded" },
         timeout: 10000,
       }
     );
     CONFIG.bling.accessToken = response.data.access_token;
     CONFIG.bling.refreshToken = response.data.refresh_token;
     CONFIG.bling.tokenExpiresAt = Date.now() + 55 * 60 * 1000;
+    salvarTokens();
     log("INFO", "Token Bling renovado com sucesso");
     return true;
   } catch (err) {
-    log("ERRO", "Falha ao renovar token Bling", { status: err.response?.status });
+    log("ERRO", "Falha ao renovar token Bling", { status: err.response?.status, data: err.response?.data });
     return false;
   }
 }
@@ -139,6 +184,53 @@ function autenticarApiKey(req, res, next) {
   if (!key || key !== CONFIG.servidor.apiKey) return res.status(401).json({ error: "não autorizado" });
   next();
 }
+
+// ============================================================
+// BLING OAuth2 — Rotas /oauth/callback e /authorize
+// ============================================================
+app.get("/oauth/callback", async (req, res) => {
+  const { code } = req.query;
+  if (!code) return res.status(400).json({ error: "Parâmetro 'code' ausente" });
+
+  try {
+    const response = await axios.post(
+      "https://www.bling.com.br/Api/v3/oauth/token",
+      new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: `${CONFIG.servidor.baseUrl}/oauth/callback`,
+      }),
+      {
+        headers: { Authorization: basicAuthHeader(), "Content-Type": "application/x-www-form-urlencoded" },
+        timeout: 15000,
+      }
+    );
+
+    CONFIG.bling.accessToken = response.data.access_token;
+    CONFIG.bling.refreshToken = response.data.refresh_token;
+    CONFIG.bling.tokenExpiresAt = Date.now() + (response.data.expires_in * 1000) - 60000;
+    salvarTokens();
+    log("OK", "OAuth concluído — tokens obtidos e salvos", { expires_in: response.data.expires_in });
+
+    res.json({
+      ok: true,
+      msg: "OAuth concluído! Tokens salvos. O webhook está pronto.",
+      refresh_token: CONFIG.bling.refreshToken,
+      expiraEm: new Date(CONFIG.bling.tokenExpiresAt).toISOString(),
+    });
+  } catch (err) {
+    log("ERRO", "Falha no OAuth callback", { error: err.message, data: err.response?.data });
+    res.status(500).json({ error: "Falha ao obter tokens", detalhes: err.response?.data || err.message });
+  }
+});
+
+app.get("/authorize", (req, res) => {
+  const authUrl = `https://www.bling.com.br/Api/v3/oauth/authorize`
+    + `?response_type=code`
+    + `&client_id=${CONFIG.bling.clientId}`
+    + `&state=lab77`;
+  res.json({ msg: "Acesse a URL abaixo no navegador para autorizar o app:", url: authUrl });
+});
 
 // ============================================================
 // FRETE BARATO — Buscar tracking
@@ -344,10 +436,11 @@ setInterval(async () => {
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
+    blingToken: CONFIG.bling.accessToken ? "ativo" : "ausente",
+    tokenExpiraEm: new Date(CONFIG.bling.tokenExpiresAt).toISOString(),
     fila: fila.size,
     uptime: Math.floor(process.uptime()) + "s",
     timestamp: new Date().toISOString(),
-    tokenExpiraEm: new Date(CONFIG.bling.tokenExpiresAt).toISOString(),
   });
 });
 
@@ -367,12 +460,15 @@ app.post("/reprocessar", autenticarApiKey, async (req, res) => {
 // ============================================================
 // INICIAR
 // ============================================================
-const VARS_OBRIGATORIAS = ["BLING_ACCESS_TOKEN", "FRETEBARATO_TOKEN", "FRETEBARATO_CUSTOMER_ID", "EMPRESA_CNPJ"];
+const VARS_OBRIGATORIAS = ["BLING_CLIENT_ID", "BLING_CLIENT_SECRET", "FRETEBARATO_TOKEN", "FRETEBARATO_CUSTOMER_ID", "EMPRESA_CNPJ"];
 const varsFaltando = VARS_OBRIGATORIAS.filter(v => !process.env[v]);
 if (varsFaltando.length > 0) {
   console.error(`[ERRO FATAL] Variáveis não configuradas: ${varsFaltando.join(", ")}`);
   process.exit(1);
 }
+
+// Carregar tokens salvos (se existirem) antes de iniciar
+carregarTokens();
 
 const PORT = process.env.PORT || 3000;
 
@@ -380,9 +476,12 @@ const PORT = process.env.PORT || 3000;
 // em localhost e o proxy externo não consegue rotear o tráfego (502)
 const server = app.listen(PORT, "0.0.0.0", () => {
   log("INFO", `Servidor na porta ${PORT} (0.0.0.0)`);
+  log("INFO", `OAuth callback: ${CONFIG.servidor.baseUrl}/oauth/callback`);
+  if (!CONFIG.bling.accessToken) {
+    log("AVISO", `Sem token Bling — acesse ${CONFIG.servidor.baseUrl}/authorize para autorizar`);
+  }
   if (!CONFIG.bling.webhookSecret) log("AVISO", "Configure BLING_WEBHOOK_SECRET!");
   if (!CONFIG.servidor.apiKey)     log("AVISO", "Configure WEBHOOK_API_KEY!");
-  if (!CONFIG.bling.refreshToken)  log("AVISO", "Configure BLING_REFRESH_TOKEN para renovação automática!");
 });
 
 // Graceful shutdown — Railway envia SIGTERM antes de matar o container
