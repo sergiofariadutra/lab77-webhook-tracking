@@ -613,8 +613,12 @@ app.get("/painel", async (req, res) => {
   let erro = "";
 
   try {
-    const response = await blingRequest("get", "/nfe?situacao=6&limite=100");
+    const response = await blingRequest("get", "/nfe?situacao=6&limite=100&pagina=1");
     const nfs = response.data?.data || [];
+    log("INFO", `Painel: ${nfs.length} NFs retornadas`, {
+      ids: nfs.map(n => n.id),
+      numeros: nfs.map(n => n.numero),
+    });
 
     if (nfs.length === 0) {
       nfsHtml = `<tr><td colspan="4" style="text-align:center;padding:20px;color:#888">Nenhuma NF autorizada encontrada</td></tr>`;
