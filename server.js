@@ -606,6 +606,75 @@ app.get("/etiquetas", autenticarApiKey, (req, res) => {
 });
 
 // ============================================================
+// PAINEL — Dashboard de NFs autorizadas
+// ============================================================
+app.get("/painel", async (req, res) => {
+  let nfsHtml = "";
+  let erro = "";
+
+  try {
+    const response = await blingRequest("get", "/nfe?situacao=6&limite=100");
+    const nfs = response.data?.data || [];
+
+    if (nfs.length === 0) {
+      nfsHtml = `<tr><td colspan="4" style="text-align:center;padding:20px;color:#888">Nenhuma NF autorizada encontrada</td></tr>`;
+    } else {
+      for (const nf of nfs) {
+        const numero = nf.numero || nf.id || "—";
+        const nome = nf.contato?.nome || nf.cliente?.nome || "—";
+        const valor = nf.valorNota != null
+          ? `R$ ${Number(nf.valorNota).toFixed(2)}`
+          : (nf.total != null ? `R$ ${Number(nf.total).toFixed(2)}` : "—");
+        const nfeId = nf.id;
+
+        nfsHtml += `<tr>
+          <td>${numero}</td>
+          <td>${nome}</td>
+          <td>${valor}</td>
+          <td><a href="/etiqueta/${nfeId}" target="_blank" style="color:#0f0;text-decoration:none">&#x1F5A8; Imprimir</a></td>
+        </tr>`;
+      }
+    }
+  } catch (err) {
+    const msg = err.response?.data?.error?.message || err.message || "Erro desconhecido";
+    log("ERRO", "Painel: erro ao buscar NFs", { error: msg, status: err.response?.status });
+    erro = `<div style="color:#f55;padding:20px;text-align:center">Erro ao buscar NFs: ${msg}</div>`;
+  }
+
+  res.send(`<!DOCTYPE html>
+<html><head>
+  <meta charset="utf-8">
+  <title>LAB77 — Painel de Etiquetas</title>
+  <meta http-equiv="refresh" content="60">
+  <style>
+    body { font-family: monospace; background: #1a1a2e; color: #e0e0e0; margin: 0; padding: 20px; }
+    h1 { color: #0f0; margin: 0 0 5px 0; }
+    .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; border-bottom: 1px solid #333; padding-bottom: 15px; }
+    .btn { background: #0f0; color: #000; border: none; padding: 8px 16px; font-family: monospace; font-weight: bold; cursor: pointer; }
+    .btn:hover { background: #0a0; }
+    table { width: 100%; border-collapse: collapse; }
+    th { text-align: left; padding: 10px; border-bottom: 2px solid #0f0; color: #0f0; }
+    td { padding: 10px; border-bottom: 1px solid #333; }
+    tr:hover { background: #222244; }
+    .sub { color: #888; font-size: 0.85em; }
+  </style>
+</head><body>
+  <div class="header">
+    <div>
+      <h1>LAB77 — Painel de Etiquetas</h1>
+      <span class="sub">Auto-refresh: 60s | ${new Date().toLocaleString("pt-BR", { timeZone: "America/Sao_Paulo" })}</span>
+    </div>
+    <button class="btn" onclick="location.reload()">Atualizar</button>
+  </div>
+  ${erro}
+  <table>
+    <thead><tr><th>Número NF</th><th>Nome</th><th>Valor</th><th>Etiqueta</th></tr></thead>
+    <tbody>${nfsHtml}</tbody>
+  </table>
+</body></html>`);
+});
+
+// ============================================================
 // INICIAR
 // ============================================================
 const VARS_OBRIGATORIAS = ["BLING_CLIENT_ID", "BLING_CLIENT_SECRET", "FRETEBARATO_TOKEN", "FRETEBARATO_CUSTOMER_ID", "EMPRESA_CNPJ"];
