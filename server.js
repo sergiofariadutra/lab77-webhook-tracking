@@ -613,16 +613,23 @@ app.get("/painel", async (req, res) => {
   let erro = "";
 
   try {
-    // Buscar todas as páginas (Bling limita 100 por página)
+    // Buscar NFs autorizadas — situacao 5 e 6 (Autorizada + Emitida DANFE)
+    // Filtra por data de emissão para pegar as mais recentes
     const nfs = [];
-    const MAX_PAGINAS = 10; // até 1000 NFs
-    for (let pagina = 1; pagina <= MAX_PAGINAS; pagina++) {
-      const response = await blingRequest("get", `/nfe?situacao=6&limite=100&pagina=${pagina}`);
-      const dados = response.data?.data || [];
-      nfs.push(...dados);
-      log("INFO", `Painel: página ${pagina} → ${dados.length} NFs`);
-      if (dados.length < 100) break; // última página
+    const MAX_PAGINAS = 10; // até 1000 NFs por situação
+
+    for (const sit of [6, 5]) {
+      for (let pagina = 1; pagina <= MAX_PAGINAS; pagina++) {
+        const response = await blingRequest("get", `/nfe?situacao=${sit}&limite=100&pagina=${pagina}`);
+        const dados = response.data?.data || [];
+        nfs.push(...dados);
+        log("INFO", `Painel: situacao=${sit} página ${pagina} → ${dados.length} NFs`);
+        if (dados.length < 100) break; // última página
+      }
     }
+
+    // Ordenar por número decrescente (mais recentes primeiro)
+    nfs.sort((a, b) => (b.numero || b.id || 0) - (a.numero || a.id || 0));
     log("INFO", `Painel: total ${nfs.length} NFs carregadas`);
 
     if (nfs.length === 0) {
@@ -650,6 +657,8 @@ app.get("/painel", async (req, res) => {
     erro = `<div style="color:#f55;padding:20px;text-align:center">Erro ao buscar NFs: ${msg}</div>`;
   }
 
+  const totalNfs = nfsHtml ? nfsHtml.split("</tr>").length - 1 : 0;
+
   res.send(`<!DOCTYPE html>
 <html><head>
   <meta charset="utf-8">
@@ -662,24 +671,82 @@ app.get("/painel", async (req, res) => {
     .btn { background: #0f0; color: #000; border: none; padding: 8px 16px; font-family: monospace; font-weight: bold; cursor: pointer; }
     .btn:hover { background: #0a0; }
     table { width: 100%; border-collapse: collapse; }
-    th { text-align: left; padding: 10px; border-bottom: 2px solid #0f0; color: #0f0; }
+    th { text-align: left; padding: 10px; border-bottom: 2px solid #0f0; color: #0f0; cursor: pointer; }
     td { padding: 10px; border-bottom: 1px solid #333; }
     tr:hover { background: #222244; }
     .sub { color: #888; font-size: 0.85em; }
+    .busca { background: #111; border: 1px solid #0f0; color: #0f0; padding: 8px 12px; font-family: monospace; width: 250px; margin-right: 10px; }
+    .paginacao { display: flex; gap: 8px; align-items: center; margin-top: 15px; justify-content: center; }
+    .paginacao button { background: #333; color: #0f0; border: 1px solid #0f0; padding: 5px 12px; font-family: monospace; cursor: pointer; }
+    .paginacao button:hover { background: #0f0; color: #000; }
+    .paginacao button.ativo { background: #0f0; color: #000; }
+    .paginacao button:disabled { opacity: 0.3; cursor: default; }
+    .info { color: #888; font-size: 0.85em; margin-top: 10px; text-align: center; }
   </style>
 </head><body>
   <div class="header">
     <div>
       <h1>LAB77 — Painel de Etiquetas</h1>
-      <span class="sub">Auto-refresh: 60s | ${new Date().toLocaleString("pt-BR", { timeZone: "America/Sao_Paulo" })}</span>
+      <span class="sub">Total: ${totalNfs} NFs | Auto-refresh: 60s | ${new Date().toLocaleString("pt-BR", { timeZone: "America/Sao_Paulo" })}</span>
     </div>
-    <button class="btn" onclick="location.reload()">Atualizar</button>
+    <div>
+      <input type="text" class="busca" id="busca" placeholder="Buscar NF ou nome..." oninput="filtrar()">
+      <button class="btn" onclick="location.reload()">Atualizar</button>
+    </div>
   </div>
   ${erro}
   <table>
     <thead><tr><th>Número NF</th><th>Nome</th><th>Valor</th><th>Etiqueta</th></tr></thead>
-    <tbody>${nfsHtml}</tbody>
+    <tbody id="tabela">${nfsHtml}</tbody>
   </table>
+  <div class="paginacao" id="paginacao"></div>
+  <div class="info" id="info"></div>
+
+  <script>
+    const POR_PAGINA = 50;
+    let paginaAtual = 1;
+    const linhas = Array.from(document.querySelectorAll('#tabela tr'));
+    let linhasFiltradas = linhas;
+
+    function filtrar() {
+      const termo = document.getElementById('busca').value.toLowerCase();
+      linhasFiltradas = linhas.filter(tr => tr.textContent.toLowerCase().includes(termo));
+      paginaAtual = 1;
+      renderizar();
+    }
+
+    function renderizar() {
+      const total = linhasFiltradas.length;
+      const totalPaginas = Math.ceil(total / POR_PAGINA) || 1;
+      if (paginaAtual > totalPaginas) paginaAtual = totalPaginas;
+
+      const inicio = (paginaAtual - 1) * POR_PAGINA;
+      const fim = inicio + POR_PAGINA;
+
+      linhas.forEach(tr => tr.style.display = 'none');
+      linhasFiltradas.slice(inicio, fim).forEach(tr => tr.style.display = '');
+
+      // Paginação
+      const pag = document.getElementById('paginacao');
+      let html = '';
+      html += '<button ' + (paginaAtual <= 1 ? 'disabled' : '') + ' onclick="ir(' + (paginaAtual-1) + ')">← Anterior</button>';
+      for (let i = 1; i <= totalPaginas; i++) {
+        if (totalPaginas > 10 && Math.abs(i - paginaAtual) > 2 && i !== 1 && i !== totalPaginas) {
+          if (i === 2 || i === totalPaginas - 1) html += '<span style="color:#888">...</span>';
+          continue;
+        }
+        html += '<button class="' + (i === paginaAtual ? 'ativo' : '') + '" onclick="ir(' + i + ')">' + i + '</button>';
+      }
+      html += '<button ' + (paginaAtual >= totalPaginas ? 'disabled' : '') + ' onclick="ir(' + (paginaAtual+1) + ')">Próxima →</button>';
+      pag.innerHTML = html;
+
+      document.getElementById('info').textContent = 'Mostrando ' + (inicio+1) + '-' + Math.min(fim, total) + ' de ' + total + ' NFs';
+    }
+
+    function ir(p) { paginaAtual = p; renderizar(); }
+
+    renderizar();
+  </script>
 </body></html>`);
 });
 
