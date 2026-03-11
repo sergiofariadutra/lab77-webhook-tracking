@@ -251,17 +251,13 @@ app.post("/webhook/bling", rateLimit, (req, res) => {
   const body = req.body;
   if (!body) return res.status(200).json({ ok: true, msg: "body vazio ignorado" });
 
-  // Log sem dados sensíveis (LGPD)
-  log("INFO", `Webhook recebido`, { event: body?.event, nfeId: body?.data?.id });
-
-  // Bling v3 eventos: nfe.criacao, nfe.atualizacao, nfe.exclusao
-  // Bling v3 envia eventos como "invoice.created", "invoice.updated"
-  // Situação 9 = Autorizada (confirmado via log de produção)
-  // Aceita também situação "A" por compatibilidade
+  // Log com situação para diagnóstico
   const situacao = body.data?.situacao?.valor ?? body.data?.situacao;
-  // Situação 6 = Autorizada (confirmado em produção LAB77)
-  // Aceita também 9 e "A" por compatibilidade com outras contas Bling
-  const situacaoAutorizada = situacao === 6 || situacao === "6" || situacao === 9 || situacao === "9" || situacao === "A";
+  log("INFO", `Webhook recebido`, { event: body?.event, nfeId: body?.data?.id, situacao });
+
+  // Aceita qualquer evento de NF — o Frete Barato decide se há tracking.
+  // Não filtramos por situação numérica: o Bling não documenta os valores
+  // e eles variam. Se o tracking não existir ainda, o retry cuida disso.
   const eventosAceitos = [
     "invoice.created",
     "invoice.updated",
@@ -270,10 +266,8 @@ app.post("/webhook/bling", rateLimit, (req, res) => {
     "nfe.update",
   ];
 
-  const deveProcessar = eventosAceitos.includes(body.event) && situacaoAutorizada;
-
-  if (!deveProcessar) {
-    log("INFO", `Evento "${body.event}" ignorado (situação: ${situacao})`);
+  if (!eventosAceitos.includes(body.event)) {
+    log("INFO", `Evento "${body.event}" ignorado`);
     return res.status(200).json({ ok: true, msg: `evento ignorado: ${body.event}` });
   }
 
