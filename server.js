@@ -255,13 +255,23 @@ app.post("/webhook/bling", rateLimit, (req, res) => {
   log("INFO", `Webhook recebido`, { event: body?.event, nfeId: body?.data?.id });
 
   // Bling v3 eventos: nfe.criacao, nfe.atualizacao, nfe.exclusao
-  const situacaoAutorizada = body.data?.situacao?.valor === "A" || body.data?.situacao === "A";
-  const eventosAceitos = ["nfe.authorized", "nfe.atualizacao", "nfe.update", "nfe.atualização"];
-  const deveProcessar = body.event === "nfe.authorized" ||
-    (eventosAceitos.includes(body.event) && situacaoAutorizada);
+  // Bling v3 envia eventos como "invoice.created", "invoice.updated"
+  // Situação 9 = Autorizada (confirmado via log de produção)
+  // Aceita também situação "A" por compatibilidade
+  const situacao = body.data?.situacao?.valor ?? body.data?.situacao;
+  const situacaoAutorizada = situacao === 9 || situacao === "9" || situacao === "A";
+  const eventosAceitos = [
+    "invoice.created",
+    "invoice.updated",
+    "nfe.authorized",
+    "nfe.atualizacao",
+    "nfe.update",
+  ];
+
+  const deveProcessar = eventosAceitos.includes(body.event) && situacaoAutorizada;
 
   if (!deveProcessar) {
-    log("INFO", `Evento "${body.event}" ignorado (situação: ${body.data?.situacao?.valor || body.data?.situacao || "desconhecida"})`);
+    log("INFO", `Evento "${body.event}" ignorado (situação: ${situacao})`);
     return res.status(200).json({ ok: true, msg: `evento ignorado: ${body.event}` });
   }
 
