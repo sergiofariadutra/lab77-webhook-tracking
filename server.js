@@ -323,11 +323,10 @@ async function buscarTrackingFreteBarato(chaveNF) {
 // ============================================================
 async function buscarEtiquetaFreteBarato(chaveNF) {
   const url = `${CONFIG.freteBarato.baseUrl}/${CONFIG.freteBarato.plataforma}/etiqueta/v1/json/${CONFIG.freteBarato.customerId}`;
+  const payload = { cnpj: CONFIG.empresa.cnpj, nota_fiscal_id: chaveNF };
+  log("INFO", `Buscando etiqueta Frete Barato`, { url, payload });
   try {
-    const response = await axios.post(url, {
-      cnpj: CONFIG.empresa.cnpj,
-      nota_fiscal_id: chaveNF,
-    }, {
+    const response = await axios.post(url, payload, {
       headers: {
         Authorization: `Bearer ${CONFIG.freteBarato.token}`,
         Accept: "application/json",
@@ -336,17 +335,25 @@ async function buscarEtiquetaFreteBarato(chaveNF) {
       },
       timeout: 15000,
     });
+    log("INFO", `Frete Barato etiqueta response ${response.status}`, {
+      keys: Object.keys(response.data || {}),
+      temEtiqueta: !!response.data?.etiqueta,
+      dataPreview: typeof response.data === "string" ? response.data.substring(0, 200) : undefined,
+    });
     const etiqueta = response.data?.etiqueta;
     if (!etiqueta) return null;
     return etiqueta;
   } catch (err) {
     const status = err.response?.status;
-    if (status === 404) return null;
+    log("ERRO", `Frete Barato etiqueta error ${status}`, {
+      payload,
+      url,
+      responseData: err.response?.data,
+      responseHeaders: err.response?.headers,
+    });
     if (err.code === "ECONNABORTED" || err.code === "ETIMEDOUT") {
       log("AVISO", "Timeout Frete Barato (etiqueta)");
-      return null;
     }
-    log("ERRO", `Frete Barato etiqueta error ${status}`, { data: err.response?.data, url });
     return null;
   }
 }
