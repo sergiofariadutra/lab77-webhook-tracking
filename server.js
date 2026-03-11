@@ -62,6 +62,7 @@ const CONFIG = {
 };
 
 const fila = new Map();
+const etiquetas = new Map();
 const emProcessamento = new Set();
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 function log(nivel, mensagem, dados = null) {
@@ -318,6 +319,39 @@ async function buscarTrackingFreteBarato(chaveNF) {
 }
 
 // ============================================================
+// FRETE BARATO — Buscar etiqueta de envio (PDF em base64)
+// ============================================================
+async function buscarEtiquetaFreteBarato(chaveNF) {
+  const url = `${CONFIG.freteBarato.baseUrl}/${CONFIG.freteBarato.plataforma}/etiqueta/v1/json/${CONFIG.freteBarato.customerId}`;
+  try {
+    const response = await axios.post(url, {
+      cnpj: CONFIG.empresa.cnpj,
+      nota_fiscal_id: chaveNF,
+    }, {
+      headers: {
+        Authorization: `Bearer ${CONFIG.freteBarato.token}`,
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "LAB77-Webhook",
+      },
+      timeout: 15000,
+    });
+    const etiqueta = response.data?.etiqueta;
+    if (!etiqueta) return null;
+    return etiqueta;
+  } catch (err) {
+    const status = err.response?.status;
+    if (status === 404) return null;
+    if (err.code === "ECONNABORTED" || err.code === "ETIMEDOUT") {
+      log("AVISO", "Timeout Frete Barato (etiqueta)");
+      return null;
+    }
+    log("ERRO", `Frete Barato etiqueta error ${status}`, { data: err.response?.data, url });
+    return null;
+  }
+}
+
+// ============================================================
 // BLING — Buscar NF e Gravar tracking (com retry automático em 401)
 // ============================================================
 async function buscarNFBling(nfeId) {
@@ -383,7 +417,25 @@ async function processarNF(nfeId, chaveNF) {
     return false;
   }
   const sucesso = await gravarTrackingBling(nfeId, trackCode);
-  if (sucesso) { log("OK", `Tracking gravado no Bling`, { nfeId, trackCode }); fila.delete(chaveNF); return true; }
+  if (sucesso) {
+    log("OK", `Tracking gravado no Bling`, { nfeId, trackCode });
+    fila.delete(chaveNF);
+
+    // Buscar etiqueta de envio
+    try {
+      const etiquetaBase64 = await buscarEtiquetaFreteBarato(chaveNF);
+      if (etiquetaBase64) {
+        etiquetas.set(String(nfeId), etiquetaBase64);
+        log("OK", `Etiqueta disponível: /etiqueta/${nfeId}`);
+      } else {
+        log("AVISO", `Etiqueta não disponível para NF ${nfeId}`);
+      }
+    } catch (err) {
+      log("AVISO", `Erro ao buscar etiqueta NF ${nfeId}`, { error: err.message });
+    }
+
+    return true;
+  }
   log("ERRO", `Falha ao gravar — fila`, { nfeId });
   fila.set(chaveNF, { nfeId, tentativas: 0, timestamp: Date.now() });
   return false;
@@ -488,6 +540,46 @@ app.post("/reprocessar", autenticarApiKey, async (req, res) => {
 });
 
 // ============================================================
+// ETIQUETAS DE ENVIO
+// ============================================================
+app.get("/etiqueta/:nfeId", async (req, res) => {
+  const { nfeId } = req.params;
+
+  // Primeiro tenta o cache em memória
+  let base64 = etiquetas.get(String(nfeId));
+
+  // Se não tem no cache, busca no Frete Barato
+  if (!base64) {
+    const nf = await buscarNFBling(Number(nfeId));
+    if (!nf) return res.status(404).json({ error: "NF não encontrada no Bling" });
+
+    const chaveNF = nf.chaveAcesso || nf.chave;
+    if (!chaveNF) return res.status(404).json({ error: "NF sem chaveAcesso" });
+
+    base64 = await buscarEtiquetaFreteBarato(chaveNF);
+    if (!base64) return res.status(404).json({ error: "Etiqueta não disponível no Frete Barato" });
+
+    etiquetas.set(String(nfeId), base64);
+  }
+
+  const pdf = Buffer.from(base64, "base64");
+  res.set({
+    "Content-Type": "application/pdf",
+    "Content-Disposition": `inline; filename="etiqueta-${nfeId}.pdf"`,
+    "Content-Length": pdf.length,
+  });
+  res.send(pdf);
+});
+
+app.get("/etiquetas", autenticarApiKey, (req, res) => {
+  const lista = [];
+  for (const nfeId of etiquetas.keys()) {
+    lista.push({ nfeId, url: `${CONFIG.servidor.baseUrl}/etiqueta/${nfeId}` });
+  }
+  res.json({ total: lista.length, etiquetas: lista });
+});
+
+// ============================================================
 // INICIAR
 // ============================================================
 const VARS_OBRIGATORIAS = ["BLING_CLIENT_ID", "BLING_CLIENT_SECRET", "FRETEBARATO_TOKEN", "FRETEBARATO_CUSTOMER_ID", "EMPRESA_CNPJ"];
@@ -513,4 +605,4 @@ inicializarTokens().then(() => {
   });
 });
 
-module.exports = { app, fila };
+module.exports = { app, fila, etiquetas };
