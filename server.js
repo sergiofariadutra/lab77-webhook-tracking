@@ -103,6 +103,7 @@ function salvarTokens() {
 }
 
 function carregarTokens() {
+  // Tenta carregar do arquivo (persiste entre restarts sem redeploy)
   try {
     if (fs.existsSync(TOKEN_FILE)) {
       const data = JSON.parse(fs.readFileSync(TOKEN_FILE, "utf-8"));
@@ -114,9 +115,19 @@ function carregarTokens() {
         temRefreshToken: !!data.refreshToken,
         expiraEm: new Date(data.expiresAt).toISOString(),
       });
+      return;
     }
   } catch (err) {
     log("AVISO", "Sem tokens salvos em disco");
+  }
+
+  // Fallback: se tem refresh_token na env var, faz refresh imediato
+  if (CONFIG.bling.refreshToken && CONFIG.bling.clientId && CONFIG.bling.clientSecret) {
+    log("INFO", "Sem arquivo de tokens — tentando refresh via BLING_REFRESH_TOKEN env var...");
+    renovarTokenBling().then((ok) => {
+      if (ok) log("OK", "Token obtido via env var no startup");
+      else log("ERRO", "Refresh via env var falhou — acesse /authorize para re-autorizar");
+    });
   }
 }
 
