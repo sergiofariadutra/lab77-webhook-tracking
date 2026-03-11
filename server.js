@@ -365,43 +365,44 @@ async function buscarNFBling(nfeId) {
 }
 
 async function gravarTrackingBling(nfeId, trackCode) {
-  // Endpoint específico para rastreamento — funciona em NFs autorizadas
-  // (PUT /nfe/{id} não permite edição de NFs com situação 6)
+  // NFs autorizadas são read-only no Bling — gravar tracking no pedido de venda
+  // 1. Buscar NF para encontrar o pedido de venda vinculado
+  const nf = await buscarNFBling(nfeId);
+  if (!nf) { log("ERRO", `Não foi possível buscar NF ${nfeId}`); return false; }
+
+  const pedidoId = nf.pedidoVenda?.id || nf.vendedor?.pedidoVenda?.id;
+
+  if (pedidoId) {
+    // Gravar tracking no pedido de venda
+    try {
+      const response = await blingRequest("put", `/pedidos/vendas/${pedidoId}`, {
+        transporte: {
+          volumes: [{ codigoRastreamento: trackCode }],
+        },
+      });
+      log("OK", `Tracking gravado no pedido ${pedidoId}`, { nfeId, trackCode });
+      return response.status === 200 || response.status === 204;
+    } catch (err) {
+      log("ERRO", `Bling PUT /pedidos/vendas/${pedidoId} error ${err.response?.status}`, {
+        data: err.response?.data,
+        nfeId,
+        trackCode,
+      });
+    }
+  } else {
+    log("AVISO", `NF ${nfeId} sem pedido de venda vinculado — tentando PUT direto na NF`);
+  }
+
+  // Fallback: tentar PUT direto na NF (funciona se NF não estiver autorizada)
   try {
-    const response = await blingRequest("put", `/nfe/${nfeId}/rastreamentos`, {
-      rastreamentos: [{ codigo: trackCode }],
+    const response = await blingRequest("put", `/nfe/${nfeId}`, {
+      transporte: {
+        volumes: [{ codigoRastreamento: trackCode }],
+      },
     });
     return response.status === 200 || response.status === 204;
   } catch (err) {
-    const status = err.response?.status;
-    log("ERRO", `Bling PUT /nfe/${nfeId}/rastreamentos error ${status}`, { data: err.response?.data });
-
-    // Fallback: tentar via transporte.volumes no PUT completo
-    if (status === 404) {
-      log("INFO", "Endpoint /rastreamentos não encontrado — tentando PUT completo...");
-      try {
-        const nf = await buscarNFBling(nfeId);
-        if (!nf) return false;
-        const payload = JSON.parse(JSON.stringify(nf));
-        delete payload.id;
-        delete payload.situacao;
-        delete payload.chaveAcesso;
-        delete payload.chave;
-        delete payload.linkDanfe;
-        delete payload.linkPDF;
-        delete payload.xml;
-        if (!payload.transporte) payload.transporte = {};
-        if (!payload.transporte.volumes || payload.transporte.volumes.length === 0) {
-          payload.transporte.volumes = [{}];
-        }
-        payload.transporte.volumes[0].codigoRastreamento = trackCode;
-        const res2 = await blingRequest("put", `/nfe/${nfeId}`, payload);
-        return res2.status === 200 || res2.status === 204;
-      } catch (err2) {
-        log("ERRO", `Bling PUT completo /nfe/${nfeId} error ${err2.response?.status}`, { data: err2.response?.data });
-        return false;
-      }
-    }
+    log("ERRO", `Bling PUT /nfe/${nfeId} error ${err.response?.status}`, { data: err.response?.data });
     return false;
   }
 }
