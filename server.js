@@ -334,12 +334,27 @@ async function gravarTrackingBling(nfeId, trackCode) {
   const nf = await buscarNFBling(nfeId);
   if (!nf) { log("ERRO", `Não foi possível buscar NF ${nfeId}`); return false; }
 
-  const transporte = JSON.parse(JSON.stringify(nf.transporte || {}));
-  if (!transporte.volumes || transporte.volumes.length === 0) transporte.volumes = [{}];
-  transporte.volumes[0].codigoRastreamento = trackCode;
+  // PUT do Bling exige payload completo — clonar NF inteira e só alterar tracking
+  const payload = JSON.parse(JSON.stringify(nf));
+
+  // Remover campos somente-leitura que o Bling rejeita no PUT
+  delete payload.id;
+  delete payload.situacao;
+  delete payload.chaveAcesso;
+  delete payload.chave;
+  delete payload.linkDanfe;
+  delete payload.linkPDF;
+  delete payload.xml;
+
+  // Garantir que transporte.volumes existe e adicionar tracking
+  if (!payload.transporte) payload.transporte = {};
+  if (!payload.transporte.volumes || payload.transporte.volumes.length === 0) {
+    payload.transporte.volumes = [{}];
+  }
+  payload.transporte.volumes[0].codigoRastreamento = trackCode;
 
   try {
-    const response = await blingRequest("put", `/nfe/${nfeId}`, { transporte });
+    const response = await blingRequest("put", `/nfe/${nfeId}`, payload);
     return response.status === 200 || response.status === 204;
   } catch (err) {
     log("ERRO", `Bling PUT /nfe/${nfeId} error ${err.response?.status}`, { data: err.response?.data });
