@@ -613,12 +613,17 @@ app.get("/painel", async (req, res) => {
   let erro = "";
 
   try {
-    const response = await blingRequest("get", "/nfe?situacao=6&limite=100&pagina=1");
-    const nfs = response.data?.data || [];
-    log("INFO", `Painel: ${nfs.length} NFs retornadas`, {
-      ids: nfs.map(n => n.id),
-      numeros: nfs.map(n => n.numero),
-    });
+    // Buscar todas as páginas (Bling limita 100 por página)
+    const nfs = [];
+    const MAX_PAGINAS = 10; // até 1000 NFs
+    for (let pagina = 1; pagina <= MAX_PAGINAS; pagina++) {
+      const response = await blingRequest("get", `/nfe?situacao=6&limite=100&pagina=${pagina}`);
+      const dados = response.data?.data || [];
+      nfs.push(...dados);
+      log("INFO", `Painel: página ${pagina} → ${dados.length} NFs`);
+      if (dados.length < 100) break; // última página
+    }
+    log("INFO", `Painel: total ${nfs.length} NFs carregadas`);
 
     if (nfs.length === 0) {
       nfsHtml = `<tr><td colspan="4" style="text-align:center;padding:20px;color:#888">Nenhuma NF autorizada encontrada</td></tr>`;
