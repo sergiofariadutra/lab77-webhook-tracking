@@ -239,10 +239,11 @@ async function buscarTrackingFreteBarato(chaveNF) {
   const url = `${CONFIG.freteBarato.baseUrl}/${CONFIG.freteBarato.plataforma}/tracking/v1/json/${CONFIG.freteBarato.customerId}`;
   try {
     const response = await axios.get(url, {
-      params: { cnpj: CONFIG.empresa.cnpj, nota_fiscal_id: chaveNF },
+      data: { cnpj: CONFIG.empresa.cnpj, nota_fiscal_id: chaveNF },
       headers: {
         Authorization: `Bearer ${CONFIG.freteBarato.token}`,
         Accept: "application/json",
+        "Content-Type": "application/json",
         "User-Agent": "LAB77-Webhook (ti@lab77.com.br)",
       },
       timeout: 10000,
