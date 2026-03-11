@@ -240,7 +240,11 @@ async function buscarTrackingFreteBarato(chaveNF) {
   try {
     const response = await axios.get(url, {
       params: { cnpj: CONFIG.empresa.cnpj, nota_fiscal_id: chaveNF },
-      headers: { Authorization: `Bearer ${CONFIG.freteBarato.token}`, "User-Agent": "LAB77-Webhook (ti@lab77.com.br)" },
+      headers: {
+        Authorization: `Bearer ${CONFIG.freteBarato.token}`,
+        Accept: "application/json",
+        "User-Agent": "LAB77-Webhook (ti@lab77.com.br)",
+      },
       timeout: 10000,
     });
     const invoice = response.data?.invoice;
@@ -253,7 +257,11 @@ async function buscarTrackingFreteBarato(chaveNF) {
       log("AVISO", "Timeout Frete Barato — próxima tentativa");
       return null;
     }
-    log("ERRO", `Frete Barato error ${status}`);
+    log("ERRO", `Frete Barato error ${status}`, {
+      data: err.response?.data,
+      headers: err.response?.headers,
+      url,
+    });
     return null;
   }
 }
