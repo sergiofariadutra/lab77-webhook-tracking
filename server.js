@@ -71,6 +71,7 @@ const CONFIG = {
 };
 
 const fila = new Map();
+const emProcessamento = new Set(); // deduplicação de webhooks simultâneos
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 function log(nivel, mensagem, dados = null) {
   const ts = new Date().toISOString();
@@ -251,13 +252,11 @@ app.post("/webhook/bling", rateLimit, (req, res) => {
   const body = req.body;
   if (!body) return res.status(200).json({ ok: true, msg: "body vazio ignorado" });
 
-  // Log com situação para diagnóstico
-  const situacao = body.data?.situacao?.valor ?? body.data?.situacao;
-  log("INFO", `Webhook recebido`, { event: body?.event, nfeId: body?.data?.id, situacao });
+  // Bling envia body flat: { event, nfeId, situacao } — sem wrapper "data"
+  const situacao = body.situacao ?? body.data?.situacao?.valor ?? body.data?.situacao;
+  const nfeId = body.nfeId ?? body.data?.id;
+  log("INFO", `Webhook recebido`, { event: body?.event, nfeId, situacao });
 
-  // Aceita qualquer evento de NF — o Frete Barato decide se há tracking.
-  // Não filtramos por situação numérica: o Bling não documenta os valores
-  // e eles variam. Se o tracking não existir ainda, o retry cuida disso.
   const eventosAceitos = [
     "invoice.created",
     "invoice.updated",
@@ -271,13 +270,44 @@ app.post("/webhook/bling", rateLimit, (req, res) => {
     return res.status(200).json({ ok: true, msg: `evento ignorado: ${body.event}` });
   }
 
-  const nfeId = body.data?.id;
-  const chaveNF = body.data?.chave;
-  if (!nfeId || !chaveNF) return res.status(400).json({ error: "dados incompletos" });
-  if (!/^\d{44}$/.test(chaveNF)) return res.status(400).json({ error: "chave NF inválida" });
+  // Só processa situação 6 (Autorizada) — evita chamadas desnecessárias ao Frete Barato
+  // para NFs ainda pendentes (situação 1) ou em processamento (situação 7/8)
+  const situacoesProcessaveis = [6, "6"];
+  if (!situacoesProcessaveis.includes(situacao)) {
+    log("INFO", `Situação ${situacao} ignorada — aguardando autorização`);
+    return res.status(200).json({ ok: true, msg: `situacao ${situacao} ignorada` });
+  }
+
+  if (!nfeId) return res.status(400).json({ error: "nfeId ausente" });
+
+  // Deduplicação — evita processar a mesma NF duas vezes se o Bling disparar webhooks duplicados
+  if (emProcessamento.has(nfeId)) {
+    log("INFO", `NF ${nfeId} já em processamento — ignorando duplicata`);
+    return res.status(200).json({ ok: true, msg: "duplicata ignorada" });
+  }
+  emProcessamento.add(nfeId);
 
   res.status(200).json({ ok: true, msg: "processando" });
-  processarNF(nfeId, chaveNF).catch((err) => log("ERRO", "Erro inesperado", { error: err.message }));
+
+  // Delay de 2s antes do GET — garante que o Bling já preencheu chaveAcesso
+  // após a autorização da SEFAZ (evita race condition)
+  setTimeout(async () => {
+    try {
+      const nf = await buscarNFBling(nfeId);
+      if (!nf) { log("ERRO", `NF ${nfeId} não encontrada na API do Bling`); emProcessamento.delete(nfeId); return; }
+      const chaveNF = nf.chaveAcesso || nf.chave;
+      if (!chaveNF || !/^\d{44}$/.test(chaveNF)) {
+        log("ERRO", `Chave NF inválida ou ausente`, { nfeId, chaveNF });
+        emProcessamento.delete(nfeId);
+        return;
+      }
+      await processarNF(nfeId, chaveNF);
+    } catch (err) {
+      log("ERRO", "Erro inesperado no webhook", { error: err.message });
+    } finally {
+      emProcessamento.delete(nfeId);
+    }
+  }, 2000);
 });
 
 // ============================================================
