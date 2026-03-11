@@ -1,17 +1,7 @@
 /**
  * LAB77 / GRUPO 77
  * Webhook: Frete Barato → Bling
- * v3.0 — Revisão completa por painel de especialistas
- *
- * Correções Rodada 1:
- *  [CRÍTICO] app.listen sem "0.0.0.0" causava 502 no Railway
- *  [CRÍTICO] PUT enviava payload completo — agora envia só { transporte }
- *  [CRÍTICO] Token Bling renovado automaticamente via refresh_token
- *  [IMPORTANTE] Evento nfe.atualizacao adicionado à lista de aceitos
- *  [IMPORTANTE] SIGTERM tratado para graceful shutdown
- *  [IMPORTANTE] Log DEBUG removido — não vaza dados sensíveis (LGPD)
- *  [IMPORTANTE] ETIMEDOUT capturado junto com ECONNABORTED
- *  [IMPORTANTE] Rate limiting básico no endpoint webhook
+ * v4.0 — Correção definitiva: OAuth2, persistência e retry
  */
 
 require("dotenv").config();
@@ -23,12 +13,11 @@ const path = require("path");
 
 const app = express();
 
-// Raw body necessário para verificar assinatura HMAC do Bling
 app.use(express.json({
   verify: (req, res, buf) => { req.rawBody = buf; }
 }));
 
-// Rate limiting simples sem dependência externa
+// Rate limiting simples
 const rateLimitMap = new Map();
 function rateLimit(req, res, next) {
   const ip = req.ip || req.connection.remoteAddress || "unknown";
@@ -53,13 +42,10 @@ function rateLimit(req, res, next) {
 // ============================================================
 const CONFIG = {
   bling: {
-    accessToken: process.env.BLING_ACCESS_TOKEN,
-    refreshToken: process.env.BLING_REFRESH_TOKEN,
     clientId: process.env.BLING_CLIENT_ID,
     clientSecret: process.env.BLING_CLIENT_SECRET,
     baseUrl: "https://www.bling.com.br/Api/v3",
     webhookSecret: process.env.BLING_WEBHOOK_SECRET,
-    tokenExpiresAt: Date.now() + 55 * 60 * 1000,
   },
   freteBarato: {
     token: process.env.FRETEBARATO_TOKEN,
@@ -76,7 +62,7 @@ const CONFIG = {
 };
 
 const fila = new Map();
-const emProcessamento = new Set(); // deduplicação de webhooks simultâneos
+const emProcessamento = new Set();
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 function log(nivel, mensagem, dados = null) {
   const ts = new Date().toISOString();
@@ -85,119 +71,171 @@ function log(nivel, mensagem, dados = null) {
 }
 
 // ============================================================
-// PERSISTÊNCIA DE TOKENS BLING (sobrevive a restarts)
+// TOKENS BLING — Persistência + Refresh
+// Usa /data se existir (Railway Volume), senão __dirname
 // ============================================================
-const TOKEN_FILE = path.join(__dirname, ".bling-tokens.json");
+const STORAGE_DIR = process.env.TOKEN_STORAGE_PATH || (fs.existsSync("/data") ? "/data" : __dirname);
+const TOKEN_FILE = path.join(STORAGE_DIR, ".bling-tokens.json");
+
+let tokens = {
+  accessToken: null,
+  refreshToken: process.env.BLING_REFRESH_TOKEN || null,
+  expiresAt: 0,
+};
 
 function salvarTokens() {
   try {
-    fs.writeFileSync(TOKEN_FILE, JSON.stringify({
-      accessToken: CONFIG.bling.accessToken,
-      refreshToken: CONFIG.bling.refreshToken,
-      expiresAt: CONFIG.bling.tokenExpiresAt,
-    }, null, 2));
+    fs.writeFileSync(TOKEN_FILE, JSON.stringify(tokens, null, 2));
     log("INFO", "Tokens salvos em disco");
   } catch (err) {
-    log("AVISO", "Falha ao salvar tokens em disco", { error: err.message });
+    log("AVISO", "Falha ao salvar tokens em disco (normal se não tem volume)", { error: err.message });
   }
 }
 
-function carregarTokens() {
-  // Tenta carregar do arquivo (persiste entre restarts sem redeploy)
+function carregarTokensDoDisco() {
   try {
     if (fs.existsSync(TOKEN_FILE)) {
       const data = JSON.parse(fs.readFileSync(TOKEN_FILE, "utf-8"));
-      if (data.accessToken) CONFIG.bling.accessToken = data.accessToken;
-      if (data.refreshToken) CONFIG.bling.refreshToken = data.refreshToken;
-      if (data.expiresAt) CONFIG.bling.tokenExpiresAt = data.expiresAt;
+      if (data.accessToken) tokens.accessToken = data.accessToken;
+      if (data.refreshToken) tokens.refreshToken = data.refreshToken;
+      if (data.expiresAt) tokens.expiresAt = data.expiresAt;
       log("INFO", "Tokens carregados do disco", {
-        temAccessToken: !!data.accessToken,
-        temRefreshToken: !!data.refreshToken,
-        expiraEm: new Date(data.expiresAt).toISOString(),
+        temAccess: !!data.accessToken,
+        temRefresh: !!data.refreshToken,
+        expira: new Date(data.expiresAt).toISOString(),
       });
-      return;
+      return true;
     }
   } catch (err) {
-    log("AVISO", "Sem tokens salvos em disco");
+    log("AVISO", "Erro ao ler tokens do disco");
   }
-
-  // Fallback: se tem refresh_token na env var, faz refresh imediato
-  if (CONFIG.bling.refreshToken && CONFIG.bling.clientId && CONFIG.bling.clientSecret) {
-    log("INFO", "Sem arquivo de tokens — tentando refresh via BLING_REFRESH_TOKEN env var...");
-    renovarTokenBling().then((ok) => {
-      if (ok) log("OK", "Token obtido via env var no startup");
-      else log("ERRO", "Refresh via env var falhou — acesse /authorize para re-autorizar");
-    });
-  }
+  return false;
 }
 
-function basicAuthHeader() {
+function basicAuth() {
   return "Basic " + Buffer.from(`${CONFIG.bling.clientId}:${CONFIG.bling.clientSecret}`).toString("base64");
 }
 
-// ============================================================
-// TOKEN BLING — Refresh automático
-// ============================================================
-async function renovarTokenBling() {
-  if (!CONFIG.bling.refreshToken || !CONFIG.bling.clientId || !CONFIG.bling.clientSecret) {
-    log("AVISO", "Refresh token não configurado — faça OAuth via /oauth/callback");
-    return false;
+async function refreshToken() {
+  if (!tokens.refreshToken) {
+    throw new Error("Sem refresh_token — faça OAuth via /authorize");
   }
+  log("INFO", "Renovando token Bling...");
+  const res = await axios.post(
+    `${CONFIG.bling.baseUrl}/oauth/token`,
+    new URLSearchParams({ grant_type: "refresh_token", refresh_token: tokens.refreshToken }),
+    {
+      headers: { Authorization: basicAuth(), "Content-Type": "application/x-www-form-urlencoded" },
+      timeout: 15000,
+    }
+  );
+  tokens.accessToken = res.data.access_token;
+  tokens.refreshToken = res.data.refresh_token;
+  tokens.expiresAt = Date.now() + (res.data.expires_in * 1000) - 120000; // renova 2min antes
+  salvarTokens();
+  log("OK", "Token Bling renovado", { expires_in: res.data.expires_in });
+}
+
+// Garante token válido — usado antes de cada chamada ao Bling
+async function getAccessToken() {
+  if (tokens.accessToken && Date.now() < tokens.expiresAt) {
+    return tokens.accessToken;
+  }
+  await refreshToken();
+  return tokens.accessToken;
+}
+
+// Chamada ao Bling com retry automático em caso de 401
+async function blingRequest(method, urlPath, data = null) {
+  const url = `${CONFIG.bling.baseUrl}${urlPath}`;
+  const accessToken = await getAccessToken();
+
+  const config = {
+    method,
+    url,
+    headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+    timeout: 10000,
+  };
+  if (data) config.data = data;
+
   try {
-    const response = await axios.post(
-      "https://www.bling.com.br/Api/v3/oauth/token",
-      new URLSearchParams({ grant_type: "refresh_token", refresh_token: CONFIG.bling.refreshToken }),
-      {
-        headers: { Authorization: basicAuthHeader(), "Content-Type": "application/x-www-form-urlencoded" },
-        timeout: 10000,
-      }
-    );
-    CONFIG.bling.accessToken = response.data.access_token;
-    CONFIG.bling.refreshToken = response.data.refresh_token;
-    CONFIG.bling.tokenExpiresAt = Date.now() + 55 * 60 * 1000;
-    salvarTokens();
-    log("INFO", "Token Bling renovado com sucesso");
-    return true;
+    return await axios(config);
   } catch (err) {
-    log("ERRO", "Falha ao renovar token Bling", { status: err.response?.status, data: err.response?.data });
-    return false;
+    if (err.response?.status === 401) {
+      log("AVISO", "401 do Bling — forçando refresh e tentando de novo...");
+      tokens.expiresAt = 0; // forçar refresh
+      const novoToken = await getAccessToken();
+      config.headers.Authorization = `Bearer ${novoToken}`;
+      return await axios(config); // se falhar de novo, propaga o erro
+    }
+    throw err;
   }
 }
 
-async function garantirTokenValido() {
-  if (Date.now() >= CONFIG.bling.tokenExpiresAt) {
-    log("INFO", "Token Bling expirado — renovando...");
-    await renovarTokenBling();
+// ============================================================
+// Inicialização de tokens — tenta disco, depois env var, depois espera OAuth
+// ============================================================
+async function inicializarTokens() {
+  // 1. Tenta carregar do disco (Railway Volume ou restart sem redeploy)
+  if (carregarTokensDoDisco()) {
+    // Se tem access token e não expirou, tudo ok
+    if (tokens.accessToken && Date.now() < tokens.expiresAt) {
+      log("OK", "Token do disco ainda válido");
+      return;
+    }
+    // Se tem refresh token, tenta renovar
+    if (tokens.refreshToken) {
+      try {
+        await refreshToken();
+        log("OK", "Token renovado a partir do disco");
+        return;
+      } catch (err) {
+        log("AVISO", "Refresh do disco falhou", { error: err.response?.data || err.message });
+      }
+    }
   }
+
+  // 2. Tenta refresh via env var
+  if (process.env.BLING_REFRESH_TOKEN) {
+    tokens.refreshToken = process.env.BLING_REFRESH_TOKEN;
+    try {
+      await refreshToken();
+      log("OK", "Token obtido via BLING_REFRESH_TOKEN env var");
+      return;
+    } catch (err) {
+      log("AVISO", "BLING_REFRESH_TOKEN env var inválido/expirado", { error: err.response?.data || err.message });
+    }
+  }
+
+  // 3. Sem token — precisa de OAuth manual
+  log("AVISO", "=== SEM TOKEN BLING ===");
+  log("AVISO", `Acesse: ${CONFIG.servidor.baseUrl}/authorize`);
 }
 
 // ============================================================
 // VERIFICAÇÃO DE ASSINATURA DO BLING (HMAC-SHA256)
 // ============================================================
 function verificarAssinaturaBling(req) {
-  if (!CONFIG.bling.webhookSecret) {
-    log("AVISO", "BLING_WEBHOOK_SECRET não configurado — webhook sem autenticação!");
-    return true;
-  }
+  if (!CONFIG.bling.webhookSecret) return true;
   const assinatura = req.headers["x-bling-signature"] || req.headers["x-signature"];
-  if (!assinatura) { log("ERRO", "Webhook sem assinatura — rejeitado"); return false; }
+  if (!assinatura) { log("ERRO", "Webhook sem assinatura"); return false; }
   const hmac = crypto.createHmac("sha256", CONFIG.bling.webhookSecret).update(req.rawBody).digest("hex");
   try {
-    const assinaturaEsperada = `sha256=${hmac}`;
-    if (assinatura.length !== assinaturaEsperada.length) return false;
-    return crypto.timingSafeEqual(Buffer.from(assinatura), Buffer.from(assinaturaEsperada));
+    const esperada = `sha256=${hmac}`;
+    if (assinatura.length !== esperada.length) return false;
+    return crypto.timingSafeEqual(Buffer.from(assinatura), Buffer.from(esperada));
   } catch { return false; }
 }
 
 function autenticarApiKey(req, res, next) {
-  if (!CONFIG.servidor.apiKey) { log("AVISO", "WEBHOOK_API_KEY não configurado!"); return next(); }
+  if (!CONFIG.servidor.apiKey) return next();
   const key = req.headers["x-api-key"];
   if (!key || key !== CONFIG.servidor.apiKey) return res.status(401).json({ error: "não autorizado" });
   next();
 }
 
 // ============================================================
-// BLING OAuth2 — Rotas /oauth/callback e /authorize
+// OAUTH — /oauth/callback e /authorize
 // ============================================================
 app.get("/oauth/callback", async (req, res) => {
   const { code } = req.query;
@@ -205,42 +243,47 @@ app.get("/oauth/callback", async (req, res) => {
 
   try {
     const response = await axios.post(
-      "https://www.bling.com.br/Api/v3/oauth/token",
+      `${CONFIG.bling.baseUrl}/oauth/token`,
       new URLSearchParams({
         grant_type: "authorization_code",
         code,
         redirect_uri: `${CONFIG.servidor.baseUrl}/oauth/callback`,
       }),
       {
-        headers: { Authorization: basicAuthHeader(), "Content-Type": "application/x-www-form-urlencoded" },
+        headers: { Authorization: basicAuth(), "Content-Type": "application/x-www-form-urlencoded" },
         timeout: 15000,
       }
     );
 
-    CONFIG.bling.accessToken = response.data.access_token;
-    CONFIG.bling.refreshToken = response.data.refresh_token;
-    CONFIG.bling.tokenExpiresAt = Date.now() + (response.data.expires_in * 1000) - 60000;
+    tokens.accessToken = response.data.access_token;
+    tokens.refreshToken = response.data.refresh_token;
+    tokens.expiresAt = Date.now() + (response.data.expires_in * 1000) - 120000;
     salvarTokens();
-    log("OK", "OAuth concluído — tokens obtidos e salvos", { expires_in: response.data.expires_in });
 
-    res.json({
-      ok: true,
-      msg: "OAuth concluído! Tokens salvos. O webhook está pronto.",
-      refresh_token: CONFIG.bling.refreshToken,
-      expiraEm: new Date(CONFIG.bling.tokenExpiresAt).toISOString(),
-    });
+    log("OK", "=== OAUTH CONCLUÍDO ===");
+    log("OK", `Novo refresh_token para env var: ${tokens.refreshToken}`);
+
+    res.send(`
+      <html><body style="font-family:monospace;padding:40px;background:#1a1a2e;color:#0f0">
+        <h1>✅ OAuth concluído!</h1>
+        <p>Tokens salvos. O webhook está pronto.</p>
+        <p>Expira em: ${new Date(tokens.expiresAt).toISOString()}</p>
+        <hr>
+        <p><strong>IMPORTANTE — Copie o refresh_token abaixo e cole na variável<br>
+        BLING_REFRESH_TOKEN no Railway (para sobreviver a redeploys):</strong></p>
+        <textarea rows="3" cols="80" onclick="this.select()">${tokens.refreshToken}</textarea>
+        <p>Depois de colar no Railway, NÃO clique em "Redeploy" — o app já está funcionando.</p>
+      </body></html>
+    `);
   } catch (err) {
-    log("ERRO", "Falha no OAuth callback", { error: err.message, data: err.response?.data });
-    res.status(500).json({ error: "Falha ao obter tokens", detalhes: err.response?.data || err.message });
+    log("ERRO", "OAuth falhou", { error: err.message, data: err.response?.data });
+    res.status(500).json({ error: "OAuth falhou", detalhes: err.response?.data || err.message });
   }
 });
 
 app.get("/authorize", (req, res) => {
-  const authUrl = `https://www.bling.com.br/Api/v3/oauth/authorize`
-    + `?response_type=code`
-    + `&client_id=${CONFIG.bling.clientId}`
-    + `&state=lab77`;
-  res.json({ msg: "Acesse a URL abaixo no navegador para autorizar o app:", url: authUrl });
+  const url = `https://www.bling.com.br/Api/v3/oauth/authorize?response_type=code&client_id=${CONFIG.bling.clientId}&state=lab77`;
+  res.redirect(url);
 });
 
 // ============================================================
@@ -255,7 +298,7 @@ async function buscarTrackingFreteBarato(chaveNF) {
         Authorization: `Bearer ${CONFIG.freteBarato.token}`,
         Accept: "application/json",
         "Content-Type": "application/json",
-        "User-Agent": "LAB77-Webhook (ti@lab77.com.br)",
+        "User-Agent": "LAB77-Webhook",
       },
       timeout: 10000,
     });
@@ -266,64 +309,40 @@ async function buscarTrackingFreteBarato(chaveNF) {
     const status = err.response?.status;
     if (status === 404) return null;
     if (err.code === "ECONNABORTED" || err.code === "ETIMEDOUT") {
-      log("AVISO", "Timeout Frete Barato — próxima tentativa");
+      log("AVISO", "Timeout Frete Barato");
       return null;
     }
-    log("ERRO", `Frete Barato error ${status}`, {
-      data: err.response?.data,
-      headers: err.response?.headers,
-      url,
-    });
+    log("ERRO", `Frete Barato error ${status}`, { data: err.response?.data, url });
     return null;
   }
 }
 
 // ============================================================
-// BLING — Buscar NF completa
+// BLING — Buscar NF e Gravar tracking (com retry automático em 401)
 // ============================================================
 async function buscarNFBling(nfeId) {
-  await garantirTokenValido();
-  const url = `${CONFIG.bling.baseUrl}/nfe/${nfeId}`;
   try {
-    const response = await axios.get(url, {
-      headers: { Authorization: `Bearer ${CONFIG.bling.accessToken}` },
-      timeout: 10000,
-    });
+    const response = await blingRequest("get", `/nfe/${nfeId}`);
     return response.data?.data || null;
   } catch (err) {
-    const status = err.response?.status;
-    if (status === 401) { log("ERRO", "Token Bling expirado — tentando renovar"); await renovarTokenBling(); }
-    log("ERRO", `Bling GET error ${status}`, { nfeId });
+    log("ERRO", `Bling GET /nfe/${nfeId} error ${err.response?.status}`, { data: err.response?.data });
     return null;
   }
 }
 
-// ============================================================
-// BLING — Gravar tracking na NF
-// Envia APENAS { transporte } — NFs autorizadas têm campos somente leitura
-// que causam 422 se o payload completo for enviado.
-// ============================================================
 async function gravarTrackingBling(nfeId, trackCode) {
-  await garantirTokenValido();
   const nf = await buscarNFBling(nfeId);
   if (!nf) { log("ERRO", `Não foi possível buscar NF ${nfeId}`); return false; }
 
-  // Clona apenas transporte — evita mutação e campos somente leitura
   const transporte = JSON.parse(JSON.stringify(nf.transporte || {}));
   if (!transporte.volumes || transporte.volumes.length === 0) transporte.volumes = [{}];
   transporte.volumes[0].codigoRastreamento = trackCode;
 
-  const url = `${CONFIG.bling.baseUrl}/nfe/${nfeId}`;
   try {
-    const response = await axios.put(url, { transporte }, {
-      headers: { Authorization: `Bearer ${CONFIG.bling.accessToken}`, "Content-Type": "application/json" },
-      timeout: 10000,
-    });
+    const response = await blingRequest("put", `/nfe/${nfeId}`, { transporte });
     return response.status === 200 || response.status === 204;
   } catch (err) {
-    const status = err.response?.status;
-    if (status === 401) log("ERRO", "Token Bling expirado");
-    log("ERRO", `Bling PUT error ${status}`, { nfeId, trackCode });
+    log("ERRO", `Bling PUT /nfe/${nfeId} error ${err.response?.status}`, { data: err.response?.data });
     return false;
   }
 }
@@ -332,7 +351,7 @@ async function gravarTrackingBling(nfeId, trackCode) {
 // PROCESSAMENTO PRINCIPAL
 // ============================================================
 async function processarNF(nfeId, chaveNF) {
-  log("INFO", `Iniciando NF`, { nfeId, chave: chaveNF.substring(0, 10) + "..." });
+  log("INFO", `Processando NF ${nfeId}`);
   let trackCode = null;
   for (let i = 1; i <= CONFIG.retry.tentativas; i++) {
     log("INFO", `Tentativa ${i}/${CONFIG.retry.tentativas}`);
@@ -350,7 +369,7 @@ async function processarNF(nfeId, chaveNF) {
   }
   const sucesso = await gravarTrackingBling(nfeId, trackCode);
   if (sucesso) { log("OK", `Tracking gravado no Bling`, { nfeId, trackCode }); fila.delete(chaveNF); return true; }
-  log("ERRO", `Falha ao gravar no Bling — NF vai para fila`, { nfeId });
+  log("ERRO", `Falha ao gravar — fila`, { nfeId });
   fila.set(chaveNF, { nfeId, tentativas: 0, timestamp: Date.now() });
   return false;
 }
@@ -362,60 +381,42 @@ app.post("/webhook/bling", rateLimit, (req, res) => {
   if (!verificarAssinaturaBling(req)) return res.status(401).json({ error: "assinatura inválida" });
 
   const body = req.body;
-  if (!body) return res.status(200).json({ ok: true, msg: "body vazio ignorado" });
+  if (!body) return res.status(200).json({ ok: true, msg: "body vazio" });
 
-  // Bling envia body flat: { event, nfeId, situacao } — sem wrapper "data"
   const situacao = body.situacao ?? body.data?.situacao?.valor ?? body.data?.situacao;
   const nfeId = body.nfeId ?? body.data?.id;
-  log("INFO", `Webhook recebido`, { event: body?.event, nfeId, situacao });
+  log("INFO", `Webhook`, { event: body?.event, nfeId, situacao });
 
-  const eventosAceitos = [
-    "invoice.created",
-    "invoice.updated",
-    "nfe.authorized",
-    "nfe.atualizacao",
-    "nfe.update",
-  ];
-
+  const eventosAceitos = ["invoice.created", "invoice.updated", "nfe.authorized", "nfe.atualizacao", "nfe.update"];
   if (!eventosAceitos.includes(body.event)) {
-    log("INFO", `Evento "${body.event}" ignorado`);
     return res.status(200).json({ ok: true, msg: `evento ignorado: ${body.event}` });
   }
 
-  // Só processa situação 6 (Autorizada) — evita chamadas desnecessárias ao Frete Barato
-  // para NFs ainda pendentes (situação 1) ou em processamento (situação 7/8)
-  const situacoesProcessaveis = [6, "6"];
-  if (!situacoesProcessaveis.includes(situacao)) {
-    log("INFO", `Situação ${situacao} ignorada — aguardando autorização`);
+  if (![6, "6"].includes(situacao)) {
     return res.status(200).json({ ok: true, msg: `situacao ${situacao} ignorada` });
   }
 
   if (!nfeId) return res.status(400).json({ error: "nfeId ausente" });
 
-  // Deduplicação — evita processar a mesma NF duas vezes se o Bling disparar webhooks duplicados
   if (emProcessamento.has(nfeId)) {
-    log("INFO", `NF ${nfeId} já em processamento — ignorando duplicata`);
     return res.status(200).json({ ok: true, msg: "duplicata ignorada" });
   }
   emProcessamento.add(nfeId);
-
   res.status(200).json({ ok: true, msg: "processando" });
 
-  // Delay de 2s antes do GET — garante que o Bling já preencheu chaveAcesso
-  // após a autorização da SEFAZ (evita race condition)
+  // Delay 2s — Bling pode não ter preenchido chaveAcesso ainda
   setTimeout(async () => {
     try {
       const nf = await buscarNFBling(nfeId);
-      if (!nf) { log("ERRO", `NF ${nfeId} não encontrada na API do Bling`); emProcessamento.delete(nfeId); return; }
+      if (!nf) { log("ERRO", `NF ${nfeId} não encontrada`); return; }
       const chaveNF = nf.chaveAcesso || nf.chave;
       if (!chaveNF || !/^\d{44}$/.test(chaveNF)) {
-        log("ERRO", `Chave NF inválida ou ausente`, { nfeId, chaveNF });
-        emProcessamento.delete(nfeId);
+        log("ERRO", `Chave NF inválida`, { nfeId, chaveNF });
         return;
       }
       await processarNF(nfeId, chaveNF);
     } catch (err) {
-      log("ERRO", "Erro inesperado no webhook", { error: err.message });
+      log("ERRO", "Erro no webhook", { error: err.message });
     } finally {
       emProcessamento.delete(nfeId);
     }
@@ -428,19 +429,19 @@ app.post("/webhook/bling", rateLimit, (req, res) => {
 let jobRunning = false;
 setInterval(async () => {
   if (fila.size === 0) return;
-  if (jobRunning) { log("AVISO", "Job ainda rodando — pulando ciclo"); return; }
+  if (jobRunning) return;
   jobRunning = true;
-  log("INFO", `Reprocessamento fila: ${fila.size} NF(s)`);
+  log("INFO", `Reprocessando fila: ${fila.size} NF(s)`);
   try {
     for (const [chaveNF, item] of fila.entries()) {
       item.tentativas++;
       const trackCode = await buscarTrackingFreteBarato(chaveNF);
       if (trackCode) {
         const ok = await gravarTrackingBling(item.nfeId, trackCode);
-        if (ok) { log("OK", `Reprocessada`); fila.delete(chaveNF); }
+        if (ok) { log("OK", `Reprocessada: ${item.nfeId}`); fila.delete(chaveNF); }
       }
       if (Date.now() - item.timestamp > 24 * 60 * 60 * 1000) {
-        log("AVISO", `Descartada após 24h`); fila.delete(chaveNF);
+        log("AVISO", `Descartada após 24h: ${item.nfeId}`); fila.delete(chaveNF);
       }
     }
   } catch (err) {
@@ -451,30 +452,24 @@ setInterval(async () => {
 }, 10 * 60 * 1000);
 
 // ============================================================
-// HEALTH CHECK
+// HEALTH + REPROCESSAMENTO MANUAL
 // ============================================================
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
-    blingToken: CONFIG.bling.accessToken ? "ativo" : "ausente",
-    tokenExpiraEm: new Date(CONFIG.bling.tokenExpiresAt).toISOString(),
+    blingToken: tokens.accessToken ? "ativo" : "ausente",
+    tokenExpira: tokens.expiresAt ? new Date(tokens.expiresAt).toISOString() : null,
     fila: fila.size,
     uptime: Math.floor(process.uptime()) + "s",
-    timestamp: new Date().toISOString(),
   });
 });
 
-// ============================================================
-// REPROCESSAMENTO MANUAL
-// ============================================================
 app.post("/reprocessar", autenticarApiKey, async (req, res) => {
   const { nfeId, chaveNF } = req.body || {};
   if (!nfeId || !chaveNF) return res.status(400).json({ error: "nfeId e chaveNF obrigatórios" });
   if (!/^\d{44}$/.test(chaveNF)) return res.status(400).json({ error: "chaveNF inválida" });
   res.json({ ok: true, msg: "processando" });
-  processarNF(nfeId, chaveNF)
-    .then((ok) => log("INFO", `Reprocessamento manual: ${ok ? "OK" : "FALHOU"}`))
-    .catch((err) => log("ERRO", "Reprocessamento manual erro", { error: err.message }));
+  processarNF(nfeId, chaveNF).catch((err) => log("ERRO", "Reprocessamento erro", { error: err.message }));
 });
 
 // ============================================================
@@ -487,27 +482,20 @@ if (varsFaltando.length > 0) {
   process.exit(1);
 }
 
-// Carregar tokens salvos (se existirem) antes de iniciar
-carregarTokens();
+// Inicializa tokens ANTES de aceitar conexões
+inicializarTokens().then(() => {
+  const PORT = process.env.PORT || 3000;
+  const server = app.listen(PORT, "0.0.0.0", () => {
+    log("INFO", `Servidor na porta ${PORT}`);
+    if (!tokens.accessToken) {
+      log("AVISO", `SEM TOKEN — acesse ${CONFIG.servidor.baseUrl}/authorize`);
+    }
+  });
 
-const PORT = process.env.PORT || 3000;
-
-// "0.0.0.0" obrigatório para Railway — sem isso o servidor escuta apenas
-// em localhost e o proxy externo não consegue rotear o tráfego (502)
-const server = app.listen(PORT, "0.0.0.0", () => {
-  log("INFO", `Servidor na porta ${PORT} (0.0.0.0)`);
-  log("INFO", `OAuth callback: ${CONFIG.servidor.baseUrl}/oauth/callback`);
-  if (!CONFIG.bling.accessToken) {
-    log("AVISO", `Sem token Bling — acesse ${CONFIG.servidor.baseUrl}/authorize para autorizar`);
-  }
-  if (!CONFIG.bling.webhookSecret) log("AVISO", "Configure BLING_WEBHOOK_SECRET!");
-  if (!CONFIG.servidor.apiKey)     log("AVISO", "Configure WEBHOOK_API_KEY!");
-});
-
-// Graceful shutdown — Railway envia SIGTERM antes de matar o container
-process.on("SIGTERM", () => {
-  log("INFO", "SIGTERM recebido — encerrando servidor");
-  server.close(() => { log("INFO", "Servidor encerrado"); process.exit(0); });
+  process.on("SIGTERM", () => {
+    log("INFO", "SIGTERM — encerrando");
+    server.close(() => process.exit(0));
+  });
 });
 
 module.exports = { app, fila };
