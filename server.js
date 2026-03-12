@@ -609,22 +609,43 @@ app.get("/etiquetas", autenticarApiKey, (req, res) => {
 // API PROXY — Para Google Sheets / Apps Script
 // ============================================================
 
-// DEBUG: listar pedidos de venda recentes para descobrir o formato do número Shopify
-app.get("/api/debug/pedidos", autenticarApiKey, async (req, res) => {
+// DEBUG: buscar pedido/NF por vários métodos
+app.get("/api/debug/buscar/:termo", autenticarApiKey, async (req, res) => {
+  const termo = req.params.termo;
+  const resultados = {};
+
+  // 1. Pedido por numero
   try {
-    const response = await blingRequest("get", "/pedidos/vendas?limite=5");
-    const pedidos = response.data?.data || [];
-    res.json(pedidos.map(p => ({
-      id: p.id,
-      numero: p.numero,
-      numeroLoja: p.numeroLoja,
-      data: p.data,
-      contato: p.contato?.nome,
-      totalKeys: Object.keys(p),
-    })));
-  } catch (err) {
-    res.status(500).json({ error: err.message, data: err.response?.data });
+    await sleep(350);
+    const r = await blingRequest("get", `/pedidos/vendas?numero=${encodeURIComponent(termo)}&limite=3`);
+    resultados.pedidoPorNumero = (r.data?.data || []).map(p => ({ id: p.id, numero: p.numero, numeroLoja: p.numeroLoja, contato: p.contato?.nome, situacao: p.situacao }));
+  } catch (e) { resultados.pedidoPorNumero = { erro: e.response?.data || e.message }; }
+
+  // 2. Pedido por numerosLojas (Shopify order ID)
+  try {
+    await sleep(350);
+    const r = await blingRequest("get", `/pedidos/vendas?numerosLojas[]=${encodeURIComponent(termo)}&limite=3`);
+    resultados.pedidoPorNumeroLoja = (r.data?.data || []).map(p => ({ id: p.id, numero: p.numero, numeroLoja: p.numeroLoja, contato: p.contato?.nome, situacao: p.situacao }));
+  } catch (e) { resultados.pedidoPorNumeroLoja = { erro: e.response?.data || e.message }; }
+
+  // 3. NF por numeroLoja
+  try {
+    await sleep(350);
+    const r = await blingRequest("get", `/nfe?numeroLoja=${encodeURIComponent(termo)}&tipo=1&limite=3`);
+    resultados.nfPorNumeroLoja = (r.data?.data || []).map(n => ({ id: n.id, numero: n.numero, situacao: n.situacao, contato: n.contato?.nome }));
+  } catch (e) { resultados.nfPorNumeroLoja = { erro: e.response?.data || e.message }; }
+
+  // 4. NF direto por ID (se for número grande)
+  if (termo.length > 8) {
+    try {
+      await sleep(350);
+      const r = await blingRequest("get", `/nfe/${termo}`);
+      const n = r.data?.data;
+      resultados.nfPorId = n ? { id: n.id, numero: n.numero, situacao: n.situacao, contato: n.contato?.nome, chaveAcesso: n.chaveAcesso } : null;
+    } catch (e) { resultados.nfPorId = { erro: e.response?.data || e.message }; }
   }
+
+  res.json({ termo, resultados });
 });
 
 // Buscar NF pelo número do pedido Shopify (via path param)
