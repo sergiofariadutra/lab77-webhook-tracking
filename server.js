@@ -609,6 +609,24 @@ app.get("/etiquetas", autenticarApiKey, (req, res) => {
 // API PROXY — Para Google Sheets / Apps Script
 // ============================================================
 
+// DEBUG: listar pedidos de venda recentes para descobrir o formato do número Shopify
+app.get("/api/debug/pedidos", autenticarApiKey, async (req, res) => {
+  try {
+    const response = await blingRequest("get", "/pedidos/vendas?limite=5");
+    const pedidos = response.data?.data || [];
+    res.json(pedidos.map(p => ({
+      id: p.id,
+      numero: p.numero,
+      numeroLoja: p.numeroLoja,
+      data: p.data,
+      contato: p.contato?.nome,
+      totalKeys: Object.keys(p),
+    })));
+  } catch (err) {
+    res.status(500).json({ error: err.message, data: err.response?.data });
+  }
+});
+
 // Buscar NF pelo número do pedido Shopify (via path param)
 // Estratégia: Shopify order → pedido de venda Bling → NF vinculada
 app.get("/api/nf-por-numero/:numeroPedido", autenticarApiKey, async (req, res) => {
