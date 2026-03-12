@@ -613,11 +613,11 @@ app.get("/etiquetas", autenticarApiKey, (req, res) => {
 app.get("/api/nf-por-numero/:numeroPedido", autenticarApiKey, async (req, res) => {
   const numeroPedido = req.params.numeroPedido;
   try {
-    const response = await blingRequest("get", `/nfe?numeroLoja=${encodeURIComponent(numeroPedido)}&tipo=1&situacao=5`);
+    const response = await blingRequest("get", `/nfe?numeroLoja=${encodeURIComponent(numeroPedido)}&tipo=1`);
     const dados = response.data?.data || [];
     if (dados.length === 0) return res.status(404).json({ error: "NF não encontrada" });
     const nf = dados[0];
-    res.json({ nfeId: nf.id, numero: nf.numero, situacao: nf.situacao });
+    res.json(nf);
   } catch (err) {
     log("ERRO", "API nf-por-numero erro", { error: err.message, status: err.response?.status });
     res.status(500).json({ error: "Erro ao consultar Bling", detalhes: err.response?.data || err.message });
