@@ -610,16 +610,68 @@ app.get("/etiquetas", autenticarApiKey, (req, res) => {
 // ============================================================
 
 // Buscar NF pelo número do pedido Shopify (via path param)
+// Estratégia: Shopify order → pedido de venda Bling → NF vinculada
 app.get("/api/nf-por-numero/:numeroPedido", autenticarApiKey, async (req, res) => {
   const numeroPedido = req.params.numeroPedido;
   try {
-    const response = await blingRequest("get", `/nfe?numeroLoja=${encodeURIComponent(numeroPedido)}&tipo=1`);
-    const dados = response.data?.data || [];
-    if (dados.length === 0) return res.status(404).json({ error: "NF não encontrada" });
-    const nf = dados[0];
-    res.json(nf);
+    // 1. Tentar via numeroLoja na NF (caso esteja preenchido)
+    try {
+      const nfeResp = await blingRequest("get", `/nfe?numeroLoja=${encodeURIComponent(numeroPedido)}&tipo=1`);
+      const nfeDados = nfeResp.data?.data || [];
+      if (nfeDados.length > 0) {
+        log("INFO", `NF encontrada via numeroLoja=${numeroPedido}`);
+        return res.json(nfeDados[0]);
+      }
+    } catch (e) {
+      log("AVISO", `Busca por numeroLoja falhou: ${e.message}`);
+    }
+
+    // 2. Buscar pedido de venda pelo número do Shopify
+    const pedidoResp = await blingRequest("get", `/pedidos/vendas?numerosLojas[]=${encodeURIComponent(numeroPedido)}&limite=1`);
+    const pedidos = pedidoResp.data?.data || [];
+
+    if (pedidos.length === 0) {
+      // 3. Tentar com # na frente
+      const pedidoResp2 = await blingRequest("get", `/pedidos/vendas?numerosLojas[]=%23${encodeURIComponent(numeroPedido)}&limite=1`);
+      const pedidos2 = pedidoResp2.data?.data || [];
+      if (pedidos2.length === 0) {
+        return res.status(404).json({ error: "Pedido não encontrado no Bling" });
+      }
+      pedidos.push(...pedidos2);
+    }
+
+    const pedido = pedidos[0];
+    log("INFO", `Pedido de venda encontrado: ${pedido.id}`, { numero: pedido.numero, numeroPedido });
+
+    // 3. Buscar NF detalhada do pedido (pode ter referência à NF)
+    const pedidoDetalhe = await blingRequest("get", `/pedidos/vendas/${pedido.id}`);
+    const pedidoData = pedidoDetalhe.data?.data;
+
+    // Procurar NF vinculada no pedido
+    const nfRef = pedidoData?.notaFiscal?.id
+      || pedidoData?.notasFiscais?.[0]?.id
+      || pedidoData?.nfe?.id;
+
+    if (nfRef) {
+      const nfResp = await blingRequest("get", `/nfe/${nfRef}`);
+      const nf = nfResp.data?.data;
+      if (nf) {
+        log("OK", `NF ${nfRef} encontrada via pedido ${pedido.id}`);
+        return res.json(nf);
+      }
+    }
+
+    // 4. Se não achou NF via pedido, listar NFs recentes e procurar pelo contato
+    log("AVISO", `Pedido ${pedido.id} sem NF vinculada direta — retornando dados do pedido`);
+    res.json({
+      pedidoId: pedido.id,
+      numeroPedido: pedido.numero,
+      contato: pedidoData?.contato?.nome || pedido.contato?.nome,
+      situacao: pedido.situacao,
+      msg: "Pedido encontrado mas sem NF vinculada diretamente. Use o ID do pedido para localizar a NF no Bling.",
+    });
   } catch (err) {
-    log("ERRO", "API nf-por-numero erro", { error: err.message, status: err.response?.status });
+    log("ERRO", "API nf-por-numero erro", { error: err.message, status: err.response?.status, data: err.response?.data });
     res.status(500).json({ error: "Erro ao consultar Bling", detalhes: err.response?.data || err.message });
   }
 });
