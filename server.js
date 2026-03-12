@@ -606,6 +606,101 @@ app.get("/etiquetas", autenticarApiKey, (req, res) => {
 });
 
 // ============================================================
+// API PROXY — Para Google Sheets / Apps Script
+// ============================================================
+
+// Buscar NF pelo número do pedido Shopify
+app.get("/api/nf-por-pedido", autenticarApiKey, async (req, res) => {
+  const numeroPedido = req.query.numeroPedido;
+  if (!numeroPedido) return res.status(400).json({ error: "numeroPedido obrigatório" });
+
+  try {
+    // Busca NF no Bling pelo número do pedido Shopify (campo numeroLoja)
+    // Tenta situacao 6 (Emitida DANFE) primeiro, depois 5 (Autorizada)
+    let nf = null;
+    for (const sit of [6, 5]) {
+      const response = await blingRequest("get", `/nfe?numeroLoja=${encodeURIComponent(numeroPedido)}&tipo=1&situacao=${sit}&limite=1`);
+      const dados = response.data?.data || [];
+      if (dados.length > 0) { nf = dados[0]; break; }
+    }
+
+    if (!nf) {
+      // Tenta sem filtro de situação (NF pode estar pendente ainda)
+      const response = await blingRequest("get", `/nfe?numeroLoja=${encodeURIComponent(numeroPedido)}&tipo=1&limite=1`);
+      const dados = response.data?.data || [];
+      if (dados.length > 0) nf = dados[0];
+    }
+
+    if (!nf) return res.status(404).json({ error: "NF não encontrada para este pedido" });
+
+    const nfeId = nf.id;
+    const situacao = nf.situacao;
+    const situacaoNome = { 1: "Pendente", 2: "Cancelada", 3: "Aguardando recibo", 4: "Rejeitada", 5: "Autorizada", 6: "Emitida DANFE", 7: "Registrada" }[situacao] || `Desconhecida (${situacao})`;
+
+    res.json({
+      nfeId,
+      numero: nf.numero,
+      situacao,
+      situacaoNome,
+      contato: nf.contato?.nome || null,
+      valorNota: nf.valorNota || nf.total || null,
+      etiquetaUrl: `${CONFIG.servidor.baseUrl}/etiqueta/${nfeId}`,
+    });
+  } catch (err) {
+    log("ERRO", "API nf-por-pedido erro", { error: err.message, status: err.response?.status });
+    res.status(500).json({ error: "Erro ao consultar Bling", detalhes: err.response?.data || err.message });
+  }
+});
+
+// Emitir (autorizar) NF no Bling
+app.post("/api/emitir-nf", autenticarApiKey, async (req, res) => {
+  const { numeroPedido, nfeId } = req.body || {};
+
+  try {
+    let id = nfeId;
+
+    // Se não passou nfeId, busca pelo número do pedido
+    if (!id && numeroPedido) {
+      const response = await blingRequest("get", `/nfe?numeroLoja=${encodeURIComponent(numeroPedido)}&tipo=1&limite=1`);
+      const dados = response.data?.data || [];
+      if (dados.length === 0) return res.status(404).json({ error: "NF não encontrada para este pedido" });
+      id = dados[0].id;
+    }
+
+    if (!id) return res.status(400).json({ error: "numeroPedido ou nfeId obrigatório" });
+
+    // Verificar situação atual
+    const nfResponse = await blingRequest("get", `/nfe/${id}`);
+    const nf = nfResponse.data?.data;
+    if (!nf) return res.status(404).json({ error: "NF não encontrada" });
+
+    if ([5, 6].includes(nf.situacao)) {
+      return res.json({
+        ok: true,
+        msg: "NF já autorizada",
+        nfeId: id,
+        situacao: nf.situacao,
+        etiquetaUrl: `${CONFIG.servidor.baseUrl}/etiqueta/${id}`,
+      });
+    }
+
+    // Enviar NF para autorização na SEFAZ
+    await blingRequest("post", `/nfe/${id}/enviar`);
+    log("OK", `NF ${id} enviada para autorização`, { numeroPedido });
+
+    res.json({
+      ok: true,
+      msg: "NF enviada para autorização na SEFAZ. Aguarde o webhook processar a etiqueta.",
+      nfeId: id,
+      etiquetaUrl: `${CONFIG.servidor.baseUrl}/etiqueta/${id}`,
+    });
+  } catch (err) {
+    log("ERRO", "API emitir-nf erro", { error: err.message, status: err.response?.status, data: err.response?.data });
+    res.status(500).json({ error: "Erro ao emitir NF", detalhes: err.response?.data || err.message });
+  }
+});
+
+// ============================================================
 // PAINEL — Dashboard de NFs autorizadas
 // ============================================================
 app.get("/painel", async (req, res) => {
