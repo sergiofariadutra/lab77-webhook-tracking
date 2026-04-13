@@ -1,0 +1,20 @@
+services:
+  lab77-webhook:
+    build: .
+    container_name: lab77-webhook
+    restart: always
+    ports:
+      - "3010:8080"
+    env_file:
+      - .env
+    volumes:
+      - lab77_webhook_data:/data
+    networks:
+      - f77-net
+
+volumes:
+  lab77_webhook_data:
+
+networks:
+  f77-net:
+    external: true
