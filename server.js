@@ -557,6 +557,21 @@ app.get("/health", (req, res) => {
   });
 });
 
+// Export tokens (one-time uso pra migração Railway → VPS).
+// Protegido por env var EXPORT_TOKENS_KEY (definida temporariamente).
+// Após migração, REMOVA a env var no Railway pra desabilitar.
+app.get("/export-tokens", (req, res) => {
+  const expected = process.env.EXPORT_TOKENS_KEY;
+  if (!expected) return res.status(404).json({ error: "endpoint desabilitado" });
+  if (req.query.key !== expected) return res.status(401).json({ error: "key inválida" });
+  res.json({
+    accessToken: tokens.accessToken,
+    refreshToken: tokens.refreshToken,
+    expiresAt: tokens.expiresAt,
+    exportedAt: new Date().toISOString(),
+  });
+});
+
 app.post("/reprocessar", autenticarApiKey, async (req, res) => {
   const { nfeId, chaveNF } = req.body || {};
   if (!nfeId || !chaveNF) return res.status(400).json({ error: "nfeId e chaveNF obrigatórios" });
