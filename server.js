@@ -44,7 +44,7 @@ const CONFIG = {
   bling: {
     clientId: process.env.BLING_CLIENT_ID,
     clientSecret: process.env.BLING_CLIENT_SECRET,
-    baseUrl: "https://www.bling.com.br/Api/v3",
+    baseUrl: "https://api.bling.com.br/Api/v3",
     webhookSecret: process.env.BLING_WEBHOOK_SECRET,
   },
   freteBarato: {
