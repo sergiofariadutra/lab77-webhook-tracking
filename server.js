@@ -10,6 +10,7 @@ const axios = require("axios");
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
+const { isInsufficientScope, escapeHtml, envFlag } = require("./lib/helpers");
 
 const app = express();
 
@@ -59,11 +60,21 @@ const CONFIG = {
     baseUrl: process.env.BASE_URL || "http://localhost:3000",
   },
   retry: { tentativas: 6, intervaloMs: 30000 },
+  // Gravação do código de rastreio de volta no Bling (PUT pedido / POST
+  // /logisticas/objetos). DESLIGADA por padrão (jun/2026): nada no fluxo atual
+  // consome esse dado — o ERP resolve rastreio direto no Frete Barato e faz
+  // fulfillment direto no Shopify. Religável com GRAVAR_RASTREIO_BLING=1
+  // (exige escopo Logística no app Bling pra NFs sem pedido vinculado).
+  gravarRastreioBling: envFlag(process.env.GRAVAR_RASTREIO_BLING),
 };
 
 const fila = new Map();
 const etiquetas = new Map();
 const emProcessamento = new Set();
+// Timestamp de quando detectamos 403 insufficient_scope no Bling.
+// Enquanto setado, não re-tentamos POST /logisticas/objetos (não adianta —
+// escopo só muda com nova autorização; limpo no /oauth/callback).
+let escopoInsuficienteDesde = null;
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 function log(nivel, mensagem, dados = null) {
   const ts = new Date().toISOString();
@@ -86,10 +97,10 @@ let tokens = {
 
 function salvarTokens() {
   try {
-    fs.writeFileSync(TOKEN_FILE, JSON.stringify(tokens, null, 2));
+    fs.writeFileSync(TOKEN_FILE, JSON.stringify(tokens, null, 2), { mode: 0o600 });
     log("INFO", "Tokens salvos em disco");
   } catch (err) {
-    log("AVISO", "Falha ao salvar tokens em disco (normal se não tem volume)", { error: err.message });
+    log("ERRO", `Falha ao salvar tokens em ${TOKEN_FILE} — tokens só em memória; restart vai exigir reautorização manual`, { error: err.message });
   }
 }
 
@@ -261,8 +272,10 @@ app.get("/oauth/callback", async (req, res) => {
     tokens.expiresAt = Date.now() + (response.data.expires_in * 1000) - 120000;
     salvarTokens();
 
+    // Nova autorização pode ter ganho escopos novos — libera re-tentativas
+    escopoInsuficienteDesde = null;
+
     log("OK", "=== OAUTH CONCLUÍDO ===");
-    log("OK", `Novo refresh_token para env var: ${tokens.refreshToken}`);
 
     res.send(`
       <html><body style="font-family:monospace;padding:40px;background:#1a1a2e;color:#0f0">
@@ -371,14 +384,13 @@ async function buscarNFBling(nfeId) {
   }
 }
 
+// Retorna { ok, semPedido } — semPedido marca itens da fila cujo único caminho
+// é o POST /logisticas/objetos (bloqueado enquanto escopoInsuficienteDesde).
 async function gravarTrackingBling(nfeId, trackCode) {
   // NFs autorizadas são read-only no Bling
   // Estratégia: buscar NF → encontrar pedido vinculado → gravar tracking no pedido
   const nf = await buscarNFBling(nfeId);
-  if (!nf) { log("ERRO", `Não foi possível buscar NF ${nfeId}`); return false; }
-
-  // Log das chaves da NF para debug (ajuda a encontrar a referência ao pedido)
-  log("INFO", `NF ${nfeId} keys: ${Object.keys(nf).join(", ")}`);
+  if (!nf) { log("ERRO", `Não foi possível buscar NF ${nfeId}`); return { ok: false, semPedido: false }; }
 
   // Tentar encontrar o pedido de venda em vários caminhos possíveis
   const pedidoId = nf.pedidoVenda?.id
@@ -395,12 +407,26 @@ async function gravarTrackingBling(nfeId, trackCode) {
         },
       });
       log("OK", `Tracking gravado no pedido ${pedidoId}`, { nfeId, trackCode });
-      return response.status === 200 || response.status === 204;
+      return { ok: response.status === 200 || response.status === 204, semPedido: false };
     } catch (err) {
-      log("ERRO", `PUT /pedidos/vendas/${pedidoId} error ${err.response?.status}`, { data: err.response?.data });
+      if (isInsufficientScope(err)) {
+        // NÃO arma escopoInsuficienteDesde aqui: o 403 do PUT é do escopo de
+        // Pedidos, e a flag bloqueia o fallback POST /logisticas/objetos (escopo
+        // Logística, independente). NFs COM pedido que falham no PUT não devem
+        // suspender as re-tentativas das NFs SEM pedido.
+        log("ERRO", `PUT /pedidos/vendas/${pedidoId}: 403 insufficient_scope — app Bling sem escopo de edição de Pedidos. Corrigir em developer.bling.com.br e reautorizar em /authorize.`, { data: err.response?.data });
+      } else {
+        log("ERRO", `PUT /pedidos/vendas/${pedidoId} error ${err.response?.status}`, { data: err.response?.data });
+      }
+      return { ok: false, semPedido: false };
     }
-  } else {
-    log("AVISO", `NF ${nfeId} sem pedido vinculado — tentando POST /logisticas/objetos`);
+  }
+
+  log("AVISO", `NF ${nfeId} sem pedido vinculado — fallback POST /logisticas/objetos`);
+
+  if (escopoInsuficienteDesde) {
+    // Não adianta re-tentar: escopo só muda com nova autorização OAuth
+    return { ok: false, semPedido: true };
   }
 
   // Fallback: criar objeto logístico (funciona sem pedido de venda)
@@ -414,19 +440,53 @@ async function gravarTrackingBling(nfeId, trackCode) {
       },
     });
     log("OK", `Objeto logístico criado para NF ${nfeId}`, { trackCode, objetoId: response.data?.data?.id });
-    return true;
+    return { ok: true, semPedido: false };
   } catch (err) {
-    log("ERRO", `POST /logisticas/objetos error ${err.response?.status}`, { data: err.response?.data });
+    if (isInsufficientScope(err)) {
+      escopoInsuficienteDesde = new Date().toISOString();
+      log("ERRO", `POST /logisticas/objetos: 403 insufficient_scope — app Bling sem escopo Logística. Corrigir em developer.bling.com.br e reautorizar em /authorize. Re-tentativas suspensas até lá.`, { data: err.response?.data });
+    } else {
+      log("ERRO", `POST /logisticas/objetos error ${err.response?.status}`, { data: err.response?.data });
+    }
+    return { ok: false, semPedido: true };
   }
-
-  return false;
 }
 
 // ============================================================
 // PROCESSAMENTO PRINCIPAL
 // ============================================================
+// Pré-carrega a etiqueta de envio no cache (o GET /etiqueta/:nfeId rebusca
+// on-demand de qualquer forma — isso aqui só esquenta o cache).
+// Retorna true se conseguiu.
+async function prefetchEtiqueta(nfeId, chaveNF) {
+  try {
+    const etiquetaBase64 = await buscarEtiquetaFreteBarato(chaveNF);
+    if (etiquetaBase64) {
+      etiquetas.set(String(nfeId), etiquetaBase64);
+      log("OK", `Etiqueta disponível: /etiqueta/${nfeId}`);
+      return true;
+    }
+    log("AVISO", `Etiqueta ainda não disponível para NF ${nfeId} (o ERP rebusca on-demand)`);
+  } catch (err) {
+    log("AVISO", `Erro ao buscar etiqueta NF ${nfeId}`, { error: err.message });
+  }
+  return false;
+}
+
 async function processarNF(nfeId, chaveNF) {
   log("INFO", `Processando NF ${nfeId}`);
+
+  // Gravação de rastreio no Bling desligada (padrão): só etiqueta.
+  // Frete Barato demora alguns minutos pra emitir após a autorização da NF —
+  // mesmo retry paciente que o fluxo legado usava pro trackCode.
+  if (!CONFIG.gravarRastreioBling) {
+    for (let i = 1; i <= CONFIG.retry.tentativas; i++) {
+      if (await prefetchEtiqueta(nfeId, chaveNF)) return true;
+      if (i < CONFIG.retry.tentativas) await sleep(CONFIG.retry.intervaloMs);
+    }
+    return false;
+  }
+
   let trackCode = null;
   for (let i = 1; i <= CONFIG.retry.tentativas; i++) {
     log("INFO", `Tentativa ${i}/${CONFIG.retry.tentativas}`);
@@ -442,28 +502,15 @@ async function processarNF(nfeId, chaveNF) {
     fila.set(chaveNF, { nfeId, tentativas: 0, timestamp: Date.now() });
     return false;
   }
-  const sucesso = await gravarTrackingBling(nfeId, trackCode);
-  if (sucesso) {
+  const r = await gravarTrackingBling(nfeId, trackCode);
+  if (r.ok) {
     log("OK", `Tracking gravado no Bling`, { nfeId, trackCode });
     fila.delete(chaveNF);
-
-    // Buscar etiqueta de envio
-    try {
-      const etiquetaBase64 = await buscarEtiquetaFreteBarato(chaveNF);
-      if (etiquetaBase64) {
-        etiquetas.set(String(nfeId), etiquetaBase64);
-        log("OK", `Etiqueta disponível: /etiqueta/${nfeId}`);
-      } else {
-        log("AVISO", `Etiqueta não disponível para NF ${nfeId}`);
-      }
-    } catch (err) {
-      log("AVISO", `Erro ao buscar etiqueta NF ${nfeId}`, { error: err.message });
-    }
-
+    await prefetchEtiqueta(nfeId, chaveNF);
     return true;
   }
   log("ERRO", `Falha ao gravar — fila`, { nfeId });
-  fila.set(chaveNF, { nfeId, tentativas: 0, timestamp: Date.now() });
+  fila.set(chaveNF, { nfeId, tentativas: 0, timestamp: Date.now(), semPedido: r.semPedido });
   return false;
 }
 
@@ -523,19 +570,31 @@ let jobRunning = false;
 setInterval(async () => {
   if (fila.size === 0) return;
   if (jobRunning) return;
+  if (!CONFIG.gravarRastreioBling) return; // fila só é usada pelo fluxo de gravação
   jobRunning = true;
-  log("INFO", `Reprocessando fila: ${fila.size} NF(s)`);
   try {
+    // Itens sem pedido vinculado dependem do POST /logisticas/objetos —
+    // enquanto o escopo estiver insuficiente, re-tentar é queimar chamada à toa.
+    let pulados = 0;
+    log("INFO", `Reprocessando fila: ${fila.size} NF(s)`);
     for (const [chaveNF, item] of fila.entries()) {
+      // Descarte de 24h ANTES do skip por escopo — senão item semPedido
+      // bloqueado por escopo insuficiente nunca expira e a fila cresce sem teto.
+      if (Date.now() - item.timestamp > 24 * 60 * 60 * 1000) {
+        log("AVISO", `Descartada após 24h: ${item.nfeId}`); fila.delete(chaveNF); continue;
+      }
+      if (escopoInsuficienteDesde && item.semPedido) { pulados++; continue; }
       item.tentativas++;
       const trackCode = await buscarTrackingFreteBarato(chaveNF);
       if (trackCode) {
-        const ok = await gravarTrackingBling(item.nfeId, trackCode);
-        if (ok) { log("OK", `Reprocessada: ${item.nfeId}`); fila.delete(chaveNF); }
+        const r = await gravarTrackingBling(item.nfeId, trackCode);
+        if (r.ok) { log("OK", `Reprocessada: ${item.nfeId}`); fila.delete(chaveNF); }
+        else if (r.semPedido) item.semPedido = true;
       }
-      if (Date.now() - item.timestamp > 24 * 60 * 60 * 1000) {
-        log("AVISO", `Descartada após 24h: ${item.nfeId}`); fila.delete(chaveNF);
-      }
+      await sleep(350); // rate limit Bling/FreteBarato (~3 req/s)
+    }
+    if (pulados > 0) {
+      log("AVISO", `${pulados} NF(s) aguardando escopo Logística (insufficient_scope desde ${escopoInsuficienteDesde}) — corrigir em developer.bling.com.br e reautorizar /authorize`);
     }
   } catch (err) {
     log("ERRO", "Erro no job", { error: err.message });
@@ -553,8 +612,19 @@ app.get("/health", (req, res) => {
     blingToken: tokens.accessToken ? "ativo" : "ausente",
     tokenExpira: tokens.expiresAt ? new Date(tokens.expiresAt).toISOString() : null,
     fila: fila.size,
+    gravarRastreioBling: CONFIG.gravarRastreioBling,
+    escopoInsuficienteDesde,
     uptime: Math.floor(process.uptime()) + "s",
   });
+});
+
+// Lista a fila de gravação pendente (auditoria/cutover) — exige API key
+app.get("/fila", autenticarApiKey, (req, res) => {
+  const itens = [];
+  for (const [chaveNF, item] of fila.entries()) {
+    itens.push({ chaveNF, ...item, timestamp: new Date(item.timestamp).toISOString() });
+  }
+  res.json({ total: itens.length, escopoInsuficienteDesde, itens });
 });
 
 // Export tokens (one-time uso pra migração Railway → VPS).
@@ -810,6 +880,12 @@ app.post("/api/emitir-nf", autenticarApiKey, async (req, res) => {
 // PAINEL — Dashboard de NFs autorizadas
 // ============================================================
 app.get("/painel", async (req, res) => {
+  // Com barra final ("/painel/"), os links relativos resolveriam errado
+  // (/painel/etiqueta/...). Normaliza com redirect relativo (funciona
+  // também atrás de proxy com prefixo).
+  if (req.originalUrl.split("?")[0].endsWith("/")) {
+    return res.redirect(301, "../painel");
+  }
   let nfsHtml = "";
   let erro = "";
 
@@ -838,24 +914,25 @@ app.get("/painel", async (req, res) => {
     } else {
       for (const nf of nfs) {
         const numero = nf.numero || nf.id || "—";
-        const nome = nf.contato?.nome || nf.cliente?.nome || "—";
+        // Nome vem do checkout (input externo) — escapar contra XSS
+        const nome = escapeHtml(nf.contato?.nome || nf.cliente?.nome || "—");
         const valor = nf.valorNota != null
           ? `R$ ${Number(nf.valorNota).toFixed(2)}`
           : (nf.total != null ? `R$ ${Number(nf.total).toFixed(2)}` : "—");
         const nfeId = nf.id;
 
         nfsHtml += `<tr>
-          <td>${numero}</td>
+          <td>${escapeHtml(numero)}</td>
           <td>${nome}</td>
           <td>${valor}</td>
-          <td><a href="/etiqueta/${nfeId}" target="_blank" style="color:#0f0;text-decoration:none">&#x1F5A8; Imprimir</a></td>
+          <td><a href="etiqueta/${encodeURIComponent(nfeId)}" target="_blank" style="color:#0f0;text-decoration:none">&#x1F5A8; Imprimir</a></td>
         </tr>`;
       }
     }
   } catch (err) {
     const msg = err.response?.data?.error?.message || err.message || "Erro desconhecido";
     log("ERRO", "Painel: erro ao buscar NFs", { error: msg, status: err.response?.status });
-    erro = `<div style="color:#f55;padding:20px;text-align:center">Erro ao buscar NFs: ${msg}</div>`;
+    erro = `<div style="color:#f55;padding:20px;text-align:center">Erro ao buscar NFs: ${escapeHtml(msg)}</div>`;
   }
 
   const totalNfs = nfsHtml ? nfsHtml.split("</tr>").length - 1 : 0;
@@ -961,11 +1038,18 @@ if (varsFaltando.length > 0) {
   process.exit(1);
 }
 
+// Sem essas o serviço SOBE, mas com autenticação desligada (fail-open) —
+// gritar no boot pra não passar despercebido.
+if (!CONFIG.bling.webhookSecret) log("ERRO", "BLING_WEBHOOK_SECRET ausente — webhook ACEITA requests sem verificação de assinatura!");
+if (!CONFIG.servidor.apiKey)     log("ERRO", "WEBHOOK_API_KEY ausente — /reprocessar, /api/* e /fila estão SEM autenticação!");
+
 // Inicializa tokens ANTES de aceitar conexões
 inicializarTokens().then(() => {
   const PORT = process.env.PORT || 3000;
   const server = app.listen(PORT, "0.0.0.0", () => {
     log("INFO", `Servidor na porta ${PORT}`);
+    log("INFO", `Persistência de tokens: ${TOKEN_FILE}`);
+    log("INFO", `Gravação de rastreio no Bling: ${CONFIG.gravarRastreioBling ? "LIGADA" : "desligada (GRAVAR_RASTREIO_BLING=1 pra ligar)"}`);
     if (!tokens.accessToken) {
       log("AVISO", `SEM TOKEN — acesse ${CONFIG.servidor.baseUrl}/authorize`);
     }

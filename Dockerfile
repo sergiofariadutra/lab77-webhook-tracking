@@ -11,7 +11,8 @@ RUN mkdir -p /data
 
 ENV NODE_ENV=production
 ENV PORT=8080
-ENV TOKEN_STORAGE_PATH=/data/tokens.json
+# Diretório (não arquivo!) — server.js faz path.join(TOKEN_STORAGE_PATH, ".bling-tokens.json")
+ENV TOKEN_STORAGE_PATH=/data
 
 EXPOSE 8080
 
