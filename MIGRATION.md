@@ -62,8 +62,11 @@ mesmo grant se matam mutuamente. Corolários:
    https://tracking.fabrica77.com.br/webhook/bling
    (secret = BLING_WEBHOOK_SECRET do .env da VPS — são novos, ≠ Railway)
 8. f77-backend (.env na VPS): LAB77_RAILWAY_URL=http://lab77-webhook:8080
+   + FEATURE_CRON_ETIQUETA_ECOMM=on  (liga a rede de segurança do cutover —
+     ver "NFs da janela do cutover" abaixo; nasce desligada por padrão)
    → docker compose up -d f77-backend (sem build)
-   → (nome da env mantido por compat; consumo agora é interno via f77-net)
+   → (nome da env LAB77_RAILWAY_URL mantido por compat; consumo agora é
+     interno via f77-net)
 ```
 
 ### Validação fim-a-fim (ciclo completo, não só container vivo)
@@ -82,9 +85,17 @@ mesmo grant se matam mutuamente. Corolários:
 ### NFs da janela do cutover
 
 Entre o passo 4 (Railway parado) e o 7 (webhook reapontado), NFs autorizadas
-não geram evento em lugar nenhum. O cron do PR 3 (f77-backend) completa chave
-e etiqueta dos pedidos e-commerce sozinho em ≤30min. Se a fila anotada no
-passo 3 não estava vazia, reprocessar na VPS:
+não geram evento em lugar nenhum. Os pedidos e-commerce (f77/lab77) são curados
+pelo cron do PR 3 (f77-backend), **desde que `FEATURE_CRON_ETIQUETA_ECOMM=on`
+esteja no `.env` do f77-backend** (passo 8): ele completa chave + etiqueta
+sozinho em ≤30min. Sem essa env o cron fica inerte e os pedidos ficam presos —
+por isso ela faz parte do passo 8, não é opcional pro cutover.
+
+Reprocessamento manual via `/reprocessar` **só faz sentido com
+`GRAVAR_RASTREIO_BLING=1`** (gravação de rastreio no Bling). Como a gravação
+está desligada por padrão, `/reprocessar` hoje só re-tenta o cache de etiqueta —
+quem cura o lado ERP é o cron do PR 3, não o `/reprocessar`. Use o `/reprocessar`
+apenas se a gravação de rastreio estiver religada e a fila (passo 3) não vazia:
 `curl -X POST -H "x-api-key: ..." -d '{"nfeId":...,"chaveNF":"..."}' 127.0.0.1:3010/reprocessar`
 
 ### Rollback (se o passo 6/validação falhar)
