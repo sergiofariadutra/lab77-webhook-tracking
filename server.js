@@ -14,6 +14,10 @@ const { isInsufficientScope, escapeHtml, envFlag } = require("./lib/helpers");
 
 const app = express();
 
+// Atrás de proxy (nginx na VPS / edge do Railway): usar X-Forwarded-For pro
+// req.ip — sem isso o rate limit vê todo mundo como 127.0.0.1 (balde único).
+app.set("trust proxy", 1);
+
 app.use(express.json({
   verify: (req, res, buf) => { req.rawBody = buf; }
 }));
