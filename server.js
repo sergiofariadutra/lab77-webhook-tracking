@@ -410,8 +410,11 @@ async function gravarTrackingBling(nfeId, trackCode) {
       return { ok: response.status === 200 || response.status === 204, semPedido: false };
     } catch (err) {
       if (isInsufficientScope(err)) {
-        escopoInsuficienteDesde = new Date().toISOString();
-        log("ERRO", `PUT /pedidos/vendas/${pedidoId}: 403 insufficient_scope — app Bling sem escopo necessário. Corrigir em developer.bling.com.br e reautorizar em /authorize. Re-tentativas suspensas até lá.`, { data: err.response?.data });
+        // NÃO arma escopoInsuficienteDesde aqui: o 403 do PUT é do escopo de
+        // Pedidos, e a flag bloqueia o fallback POST /logisticas/objetos (escopo
+        // Logística, independente). NFs COM pedido que falham no PUT não devem
+        // suspender as re-tentativas das NFs SEM pedido.
+        log("ERRO", `PUT /pedidos/vendas/${pedidoId}: 403 insufficient_scope — app Bling sem escopo de edição de Pedidos. Corrigir em developer.bling.com.br e reautorizar em /authorize.`, { data: err.response?.data });
       } else {
         log("ERRO", `PUT /pedidos/vendas/${pedidoId} error ${err.response?.status}`, { data: err.response?.data });
       }
@@ -575,6 +578,11 @@ setInterval(async () => {
     let pulados = 0;
     log("INFO", `Reprocessando fila: ${fila.size} NF(s)`);
     for (const [chaveNF, item] of fila.entries()) {
+      // Descarte de 24h ANTES do skip por escopo — senão item semPedido
+      // bloqueado por escopo insuficiente nunca expira e a fila cresce sem teto.
+      if (Date.now() - item.timestamp > 24 * 60 * 60 * 1000) {
+        log("AVISO", `Descartada após 24h: ${item.nfeId}`); fila.delete(chaveNF); continue;
+      }
       if (escopoInsuficienteDesde && item.semPedido) { pulados++; continue; }
       item.tentativas++;
       const trackCode = await buscarTrackingFreteBarato(chaveNF);
@@ -582,9 +590,6 @@ setInterval(async () => {
         const r = await gravarTrackingBling(item.nfeId, trackCode);
         if (r.ok) { log("OK", `Reprocessada: ${item.nfeId}`); fila.delete(chaveNF); }
         else if (r.semPedido) item.semPedido = true;
-      }
-      if (Date.now() - item.timestamp > 24 * 60 * 60 * 1000) {
-        log("AVISO", `Descartada após 24h: ${item.nfeId}`); fila.delete(chaveNF);
       }
       await sleep(350); // rate limit Bling/FreteBarato (~3 req/s)
     }
