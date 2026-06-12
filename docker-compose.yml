@@ -4,11 +4,27 @@ services:
     container_name: lab77-webhook
     restart: always
     ports:
-      - "3010:8080"
+      # SÓ loopback — quem expõe pra internet é o nginx (deploy/nginx-tracking.conf).
+      # Bind em 0.0.0.0 furaria o ufw via iptables do Docker (mesma classe do
+      # achado "porta 3002" da auditoria de jun/2026).
+      - "127.0.0.1:3010:8080"
     env_file:
       - .env
     volumes:
+      # Persiste /data/.bling-tokens.json — sem isso, todo restart perde os
+      # tokens do Bling e exige reautorização manual em /authorize.
       - lab77_webhook_data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     networks:
       - f77-net
 
@@ -16,5 +32,9 @@ volumes:
   lab77_webhook_data:
 
 networks:
+  # Rede compartilhada com o f77-backend: permite o ERP consumir as etiquetas
+  # por dentro (http://lab77-webhook:8080) sem passar pela internet.
+  # Pré-requisito (ver MIGRATION.md): a rede precisa existir e o f77-backend
+  # precisa estar nela. Se ela não existir: docker network create f77-net
   f77-net:
     external: true
