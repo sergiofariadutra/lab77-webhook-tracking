@@ -1,0 +1,9 @@
+.env
+.env.*
+!.env.example
+.git
+.gitignore
+node_modules
+.bling-tokens.json
+*.md
+deploy
